@@ -1,93 +1,49 @@
-import random
+from votekit.pref_profile import PreferenceProfile
 import numpy as np
+from numpy.typing import NDArray
 
-def noise_cvr_array(CVR, candidates, exhaust_sentinel=-1, noise_level=0.05):
-    """
-    Create a noised version of the CVR array following the same rules as noise_bal.
-    
-    Args:
-        CVR: numpy array where each row is a ballot
-        candidates: set of valid candidate IDs
-        exhaust_sentinel: value representing exhausted/non-candidate (-1)
-        noise_level: fraction of ballots to noise
-    
-    Returns:
-        noised_BAL: numpy array with same shape as CVR but with noised ballots
-    """
-    noised_BAL = CVR.copy()
-    n_ballots = len(CVR)
-    n_to_noise = int(noise_level * n_ballots)
-    
-    # Randomly select indices to noise
-    noised_indices = random.sample(range(n_ballots), k=n_to_noise)
-    
-    for idx in noised_indices:
-        ballot = CVR[idx].copy()
-        noised_BAL[idx] = noise_single_cvr(ballot, candidates, exhaust_sentinel)
-    
-    return noised_BAL
+def convert_pf_to_numpy_arrays(
+        pf: PreferenceProfile
+    ) -> tuple[NDArray, NDArray, NDArray]:
+        """
+        This converts the profile into a numpy matrix with some helper arrays for faster iteration.
 
-def noise_single_cvr(ballot, candidates, exhaust_sentinel=-1):
-    """
-    Apply noise to a single CVR ballot following the original noise_bal logic.
-    """
-    # Convert ballot to list of non-exhaust candidates (equivalent to the old tuple format)
-    active_positions = ballot != exhaust_sentinel
-    if not np.any(active_positions):
-        # All exhausted ballot - treat as empty
-        bal_list = []
-    else:
-        bal_list = ballot[active_positions].tolist()
-    
-    # Check if this is an "exhausted" ballot (equivalent to old (6,) case)
-    if len(bal_list) == 0 or (len(bal_list) == 1 and bal_list[0] not in candidates):
-        return random.choice([
-            np.array([1, 2, exhaust_sentinel], dtype=ballot.dtype),
-            np.array([2, exhaust_sentinel, exhaust_sentinel], dtype=ballot.dtype),
-            np.array([3, exhaust_sentinel, exhaust_sentinel], dtype=ballot.dtype),
-            np.array([4, 1, exhaust_sentinel], dtype=ballot.dtype),
-            np.array([5, 1, exhaust_sentinel], dtype=ballot.dtype)
-        ])
-    
-    noise_type = random.choice([1, 2, 3, 4, 5])
-    
-    if noise_type == 2:  # delete ranking
-        if len(bal_list) == 1:
-            noise_type = 1
-        else:
-            del_pos = random.randint(0, len(bal_list) - 1)
-            del bal_list[del_pos]
-    
-    if noise_type == 1:  # insert ranking
-        available_cands = [c for c in candidates if c not in bal_list]
-        if available_cands:  # only insert if there are candidates available
-            cand_to_insert = random.choice(available_cands)
-            insert_pos = random.randint(0, len(bal_list))
-            bal_list.insert(insert_pos, cand_to_insert)
-    
-    if noise_type == 3:  # permute two rankings
-        if len(bal_list) == 1:
-            noise_type = 4
-        else:
-            indices = random.sample(range(len(bal_list)), 2)
-            bal_list[indices[0]], bal_list[indices[1]] = bal_list[indices[1]], bal_list[indices[0]]
-    
-    if noise_type == 4:  # switch one ranking with another non-ranked candidate
-        available_cands = [c for c in candidates if c not in bal_list]
-        if available_cands and len(bal_list) > 0:
-            cand_to_switch_in = random.choice(available_cands)
-            switch_pos = random.randint(0, len(bal_list) - 1)
-            bal_list[switch_pos] = cand_to_switch_in
-    
-    if noise_type == 5:  # become "exhausted" (equivalent to old (6,))
-        # Create a ballot with one invalid candidate
-        result = np.full(ballot.shape, exhaust_sentinel, dtype=ballot.dtype)
-        result[0] = max(candidates) + 1  # Use a candidate ID not in the race
-        return result
-    
-    # Convert back to array format
-    result = np.full(ballot.shape, exhaust_sentinel, dtype=ballot.dtype)
-    for i, cand in enumerate(bal_list[:len(ballot)]):
-        result[i] = cand
-    
-    return result
+        Args:
+            profile (RankProfile): The preference profile to convert.
+
+        Returns:
+            tuple[NDArray, NDArray, NDArray]: The ballot matrix, weights vector, and
+                first-preference vector.
+        """
+        df = pf.df
+        candidate_to_index = {
+            frozenset([name]): i for i, name in enumerate(pf.candidates)
+        }
+        candidate_to_index[frozenset(["~"])] = -127
+
+        ranking_columns = [c for c in df.columns if c.startswith("Ranking")]
+        num_rows = len(df)
+        num_cols = len(ranking_columns)
+        cells = df[ranking_columns].to_numpy()
+
+        def map_cell(cell):
+            try:
+                return candidate_to_index[cell]
+            except KeyError:
+                raise TypeError("Ballots must have rankings.")
+
+        mapped = np.frompyfunc(map_cell, 1, 1)(cells).astype(np.int8)
+
+        # Add padding
+        ballot_matrix: NDArray = np.full((num_rows, num_cols + 1), -126, dtype=np.int8)
+        ballot_matrix[:, :num_cols] = mapped
+
+        wt_vec: NDArray = df["Weight"].astype(np.float64).to_numpy()
+        fpv_vec: NDArray = ballot_matrix[:, 0].copy()
+
+        # Reject ballots that have no rankings at all (all -127)
+        empty_rows = np.where(np.all(ballot_matrix == -127, axis=1))[0]
+        if empty_rows.size:
+            raise TypeError("Ballots must have rankings.")
+
+        return ballot_matrix, wt_vec, fpv_vec
