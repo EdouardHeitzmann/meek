@@ -1,7 +1,8 @@
 import networkx as nx
 import matplotlib.pyplot as plt
 import numpy as np
-from votekit.elections.election_types.ranking.meek import MeekCore
+#from votekit.elections.election_types.ranking.meek import MeekCore
+from edouard.ranking_election.meek import MeekCore
 import string
 import textwrap
 from .utils import convert_pf_to_numpy_arrays
@@ -486,6 +487,17 @@ class MeekGraph:
             'nodes_per_layer': {layer: len(nodes) for layer, nodes in self.nodes_by_layer.items()}
         }
         return stats
+
+    def check_coherence(self):
+        """Check that all degree-m nodes share the same winner set."""
+        winner_sets = set()
+        for _, data in self.tree.nodes(data=True):
+            winners = data.get("winner_to_cand", [])
+            if len(winners) == self.m:
+                winner_sets.add(frozenset(winners))
+                if len(winner_sets) > 1:
+                    return False
+        return True
     
     def analyze_paths(self):
         """Analyze all possible paths from root to leaves"""
