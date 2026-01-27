@@ -16,7 +16,7 @@ if str(SRC_DIR) not in sys.path:
 
 from votekit.cleaning import remove_and_condense_rank_profile
 from votekit.cvr_loaders import load_scottish
-from votekit.elections.election_types.ranking.meek import MeekSTV
+from src.edouard.ranking_election.meek import MeekSTV
 
 from edouard.MeekGraph import MeekGraph
 from src.edouard.src.margin_audits import end_to_end_synthetic_audit_3seat
