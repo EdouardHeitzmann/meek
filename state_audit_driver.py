@@ -369,60 +369,36 @@ def main():
 
                 if path.name.lower().startswith("nsw_2016"):
                     manual_remove = [
-                        "Ken CANNING",
-                        "Susan PRICE",
-                        "Sharlene LEROY-DYER",
-                        "Howard BYRNES",
-                        "Brian Malcolm TUCKER",
-                        "Maree NICHOLS",
-                        "Allan THOMAS",
-                        "Bruce RELPH",
-                        "Mitch CARR",
-                        "Sam KEARNS",
-                        "Darren McINTOSH",
-                        "Ian Robert BRYCE",
-                        "Dee ELLIS",
-                        "Christopher BUCKMAN",
-                        "Methuen MORGAN",
-                        "James COGAN",
-                        "John DAVIS",
-                        "Anthony Geno BELCASTRO",
-                        "Robert BUTLER",
-                        "Ann LAWLER",
-                        "Rob BRYDEN",
-                        "Daniel KIRKNESS",
-                        "Eric GREENING",
-                        "Andy THOMPSON",
-                        "Paul QUINN",
-                        "Gregory FREARSON",
-                        "Ross FITZGERALD",
-                        "Sue RAYE",
-                    ]
-                    candidate_map = {normalize_name(name): name for name in profile.candidates}
-                    resolved_remove = []
-                    missing = []
-                    for name in manual_remove:
-                        normalized = normalize_name(name)
-                        actual = candidate_map.get(normalized)
-                        used_swap = False
-                        if actual is None:
-                            swapped = swap_first_last(name)
-                            actual = candidate_map.get(normalize_name(swapped))
-                            used_swap = actual is not None
-                        if used_swap:
-                            print(f"Swapped name order for removal: {name} -> {actual}")
-                        if actual is None:
-                            missing.append(name)
-                        else:
-                            resolved_remove.append(actual)
-                    if missing:
-                        sample = ", ".join(profile.candidates[:10])
-                        raise RuntimeError(
-                            "Manual removal names not found in profile: "
-                            f"{missing}. Sample candidates: {sample}"
-                        )
-                    print(f"Preemptively removing {len(resolved_remove)} candidates for {path.name}")
-                    profile = remove_and_condense_rank_profile(resolved_remove, profile)
+                    "Ken CANNING",
+                    "Susan PRICE",
+                    "Sharlene LEROY-DYER",
+                    "Howard BYRNES",
+                    "Brian Malcolm TUCKER",
+                    "Maree NICHOLS",
+                    "Allan THOMAS",
+                    "Bruce RELPH",
+                    "Mitch CARR",
+                    "Sam KEARNS",
+                    "Darren McINTOSH",
+                    "Ian Robert BRYCE",
+                    "Dee ELLIS",
+                    "Christopher BUCKMAN",
+                    "Methuen MORGAN",
+                    "James COGAN",
+                    "John DAVIS",
+                    "Anthony Geno BELCASTRO",
+                    "Robert BUTLER",
+                    "Ann LAWLER",
+                    "Rob BRYDEN",
+                    "Daniel KIRKNESS",
+                    "Eric GREENING",
+                    "Andy THOMPSON",
+                    "Paul QUINN",
+                    "Gregory FREARSON",
+                    "Ross FITZGERALD",
+                    "Sue RAYE",
+                ]+['Jason Mark OLBOURNE', 'Ray GOODLASS', 'Phil JOBE', 'Nella HALL', 'Sam DASTYARI', 'Ray THORPE', 'Tom HARRIS', 'Brian BURSTON', 'Gillian EVANS', 'Steven LOPEZ', 'Lee RHIANNON', 'Arthur SINODINOS', 'William BOURKE', 'Ken STEVENS', 'James JANSSON', 'Dave VINCENT', 'Teresa VAN LIESHOUT', 'Peter BREEN', 'Adam WASHBOURNE', 'Berge Anthony DER SARKISSIAN', 'Paul McCORMACK', 'Karl HOUSEMAN', 'Deborah Ann Jane LIONS', 'Shayne HIGSON', 'Christine DONAYRE', 'Marise PAYNE', 'Sarah FERNANDES', 'Peter RAHME', 'Gordon ELKINGTON', 'Peter JOHNSON', 'Kate PARKER', 'Tania Stephanie PIPER', 'Alexandra COSTELLO', 'Kerry KOLIADIS', 'Dean MACKIN', 'Sally VINCENT', 'Robert James MARKS', 'Susan PERROW', 'Charles KNOX', 'Janise FARRELL', 'Beth SMITH', 'Andrew PHILLIPS', 'Jai COOPER', 'Nathan SPATARO', 'Christine Pamela BERNIER', 'Fiona NASH', 'Danny LIM', 'Jane OAKLEY', "Deborah O'NEILL", 'Archie LEA', 'Andrew John KATELARIS', 'Christina HO', 'Rhonda AVASALU', 'Leanne PAFF', 'Colin BROADBRIDGE', 'Nigel James SMITH', 'Greg GRAHAM', 'John WILLIAMS', 'Jenny McALLISTER', 'Concetta FIERRAVANTI-WELLS', 'Warren GRZIC', 'Jim MOLAN', 'Anthony DONA', 'Lena EL-DAGHL', 'Chris OSBORNE', 'Mark BRADBURY', 'James WRIGHT', 'Sang OK', 'Nicholas GLEDHILL', 'Paul Yi-Wen HAN', 'Nick CHAPMAN', 'Doug CAMERON', 'Arthur John EMMETT', 'Fiona LEVINY', 'Eve SLAVICH', 'Bryan LAMBERT', 'Cara Melissa DONNELLY', 'David ASH', 'Ash ROSE', 'Tara MORIARTY', 'Jane WARD', 'Michael OSBORNE', 'Stacey DOWSON', 'Liam MUNDAY', 'Simon McCAFFREY', 'Peter GOOLEY', 'Maree Ann CRUZE', 'Jananie JANARTHANA', 'Vivien THOMSON', 'John COOPER', 'Joanna RZETELSKI', 'Santa SPRUCE-PEET-BOYD', 'Kathryn MAIDEN', 'Peter WALLACE', 'Shuo ZHOU', 'Peter MULLER', "Mary O'SULLIVAN", 'Wes FANG', 'Sam KENNARD', 'Richelle Girado TSAY', 'Marika KONTELLIS', 'Sarah RICHARDS', 'Jagath BANDARA', 'Hollie HUGHES', 'Ron POULSEN', 'Victoria McGAHEY', 'Dawn WILLIS', 'Gareth BRYANT', 'Miriam RIZVI', 'Stephen MULLER', 'Leonard BROWN', 'Ingrid RALPH', 'Colin BENNETT']
+                    profile = remove_and_condense_rank_profile(manual_remove, profile)
                     if len(profile.candidates) > np.iinfo(np.int8).max:
                         raise RuntimeError(
                             f"Candidate count {len(profile.candidates)} still exceeds int8 limit after manual removal."
