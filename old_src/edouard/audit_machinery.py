@@ -1,6 +1,6 @@
 import numpy as np
 import math
-from src.edouard.permutations import update_perm_idx_vectorized
+from old_src.edouard.permutations import update_perm_idx_vectorized
 
 def project_matrix_onto_election_state(
     sample_matrix,

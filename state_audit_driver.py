@@ -10,16 +10,16 @@ import numpy as np
 import pandas as pd
 
 ROOT_DIR = Path(__file__).resolve().parent
-SRC_DIR = ROOT_DIR / "src"
+SRC_DIR = ROOT_DIR / "old_src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from votekit.cleaning import remove_and_condense_rank_profile
 from votekit.cvr_loaders import load_scottish
-from src.edouard.ranking_election.meek import MeekSTV
+from old_src.edouard.ranking_election.meek import MeekSTV
 
 from edouard.MeekGraph import MeekGraph
-from src.edouard.src.margin_audits import end_to_end_synthetic_audit_3seat
+from old_src.edouard.src.margin_audits import end_to_end_synthetic_audit_3seat
 
 
 def normalize_name(name):

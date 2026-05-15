@@ -2,14 +2,14 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
+SRC = ROOT / "old_src"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from votekit.pref_profile import PreferenceProfile
-from src.edouard.MeekGraph_new import MeekGraph
+from old_src.edouard.MeekGraph_new import MeekGraph
 
 
 def main():

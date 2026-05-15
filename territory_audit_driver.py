@@ -6,14 +6,14 @@ from fractions import Fraction
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
-SRC_DIR = ROOT_DIR / "src"
+SRC_DIR = ROOT_DIR / "old_src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from votekit.cvr_loaders import load_scottish
 
 from edouard.MeekGraph import MeekGraph
-from src.edouard.src.margin_audits import end_to_end_synthetic_audit_3seat
+from old_src.edouard.src.margin_audits import end_to_end_synthetic_audit_3seat
 
 
 def parse_fraction(text):
