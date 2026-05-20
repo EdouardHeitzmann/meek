@@ -95,7 +95,7 @@ class ElectionEdge:
 
 
 @dataclass(slots=True)
-class RuntimeCache:
+class WIGMRuntimeCache:
     """
     Expansion-only cache. This should not be considered durable graph data.
     """

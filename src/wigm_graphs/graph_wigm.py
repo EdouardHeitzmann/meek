@@ -6,9 +6,8 @@ from .datatypes import (
     ElectionEdge,
     StateKey,
     EdgeRef,
-    VertexRef,
-    RuntimeCache,
-)
+    VertexRef,)
+from .datatypes import WIGMRuntimeCache as RuntimeCache
 
 import numpy as np
 from numpy.typing import NDArray
@@ -397,23 +396,27 @@ class WIGMGraphConstructor:
                 )
 
         else:
-            # Optional election edges for candidates within LAM of quota.
-            winner_idx = np.where(v.tallies > self.quota - self.LAM)[0]
+            # Optional election edges for candidates within LAM of highest tally.
+            highest_tally = np.max(v.tallies)
+            if highest_tally > self.quota - self.LAM:
+                winner_idx_within_lam = np.where(
+                    (v.tallies >= max(highest_tally, self.quota) - self.LAM)
+                )[0]
 
-            for candidate in winner_idx:
-                tally = v.tallies[candidate]
-                transfer_value = (tally - self.quota) / tally
+                for candidate in winner_idx_within_lam:
+                    tally = v.tallies[candidate]
+                    transfer_value = (tally - self.quota) / tally
 
-                updated_wt_vec = wt_vec.copy()
-                updated_wt_vec[cache.fpv_vec == candidate] *= transfer_value
+                    updated_wt_vec = wt_vec.copy()
+                    updated_wt_vec[cache.fpv_vec == candidate] *= transfer_value
 
-                yield ChildProposal(
-                    action=EdgeAction.ELECT,
-                    candidate=int(candidate),
-                    transfer_value=transfer_value,
-                    wt_vec=updated_wt_vec,
-                    margin=float(max(self.quota - tally, 0.0)),
-                )
+                    yield ChildProposal(
+                        action=EdgeAction.ELECT,
+                        candidate=int(candidate),
+                        transfer_value=transfer_value,
+                        wt_vec=updated_wt_vec,
+                        margin=float(max(self.quota - tally, 0.0)),
+                    )
 
             # Optional elimination edges for candidates within LAM of lowest tally.
             hopefuls = np.array(list(v.key.hopefuls), dtype=int)
