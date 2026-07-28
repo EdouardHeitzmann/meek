@@ -1,3 +1,6 @@
+from itertools import combinations
+from math import comb
+
 from .datatypes import (
     EdgeAction,
     EdgeStatus,
@@ -8,37 +11,29 @@ from .datatypes import (
     EdgeRef,
     VertexRef,)
 from .datatypes import WIGMRuntimeCache as RuntimeCache
+try:
+    from ..election_graphs import AbstractGraphConstructor, ChildProposal
+    from ..election_graphs.utils import (
+        frozen_mentions_from_matrix,
+        search_strong_weak_candidates,
+        weak_candidates_from_strong,
+    )
+except ImportError:
+    from election_graphs import AbstractGraphConstructor, ChildProposal
+    from election_graphs.utils import (
+        frozen_mentions_from_matrix,
+        search_strong_weak_candidates,
+        weak_candidates_from_strong,
+    )
 
 import numpy as np
 from numpy.typing import NDArray
-from typing import Iterable
-from collections import deque, defaultdict
-from dataclasses import dataclass
+from typing import Iterable, Sequence
+from collections import defaultdict
+import warnings
 
 
-@dataclass(slots=True)
-class ChildProposal:
-    """
-    Produced by election logic when expanding a vertex.
-
-    `margin` is edge-local: it is the LAM threshold needed for this parent
-    to justify this child edge. It does not incorporate the parent's own
-    tightest_margin.
-    """
-    action: EdgeAction
-    candidate: int
-
-    status: EdgeStatus = EdgeStatus.DEFAULT
-
-    # Mainly for ELECT / FORCE_ELECT proposals.
-    transfer_value: float | None = None
-    wt_vec: NDArray[np.float64] | None = None
-
-    # Edge-local margin.
-    margin: float | None = None
-
-
-class WIGMGraphConstructor:
+class WIGMGraphConstructor(AbstractGraphConstructor):
     def __init__(
         self,
         profile,
@@ -46,56 +41,104 @@ class WIGMGraphConstructor:
         LAM: float,
         *,
         memory_lite: bool = False,
+        trip_when_incoherent: bool = False,
+        simultaneous: bool = False,
+        store_fpv_vec: bool = True,
     ) -> None:
-        self.profile = profile
-        self.candidate_names = list(profile.candidates)
-        self.n_candidates = len(self.candidate_names)
-        self.m = m
-        self.LAM = LAM
-        self.memory_lite = memory_lite
-
-        self.ballot_matrix, self.root_wt_vec = self._make_ballot_matrix(profile)
-        self.candidate_stencils = self._make_candidate_stencils(self.ballot_matrix)
-
-        # Droop quota.
-        self.quota = np.floor(self.root_wt_vec.sum() / (self.m + 1)) + 1
-
-        # Layered graph storage.
-        self.layers: list[list[ElectionState]] = []
-        self.edge_layers: list[list[ElectionEdge]] = []
-
-        # Per-layer state-key deduplication.
-        self.layer_index: list[dict[StateKey, int]] = []
-
-        # Edge lookup / access.
-        self.edge_by_ref: dict[EdgeRef, ElectionEdge] = {}
-        self.edge_lookup: dict[
-            tuple[VertexRef, VertexRef, EdgeAction, int],
-            EdgeRef,
-        ] = {}
-
-        # DFS stack.
-        self.stack: deque[VertexRef] = deque()
-        self.enqueued: set[VertexRef] = set()
-
-        # Cache reconstruction bookkeeping.
-        self.runtime_cache: dict[VertexRef, RuntimeCache] = {}
-        self.primary_parent_edge: dict[VertexRef, EdgeRef] = {}
-        self.pending_primary_children: dict[VertexRef, int] = defaultdict(int)
-
-        # Index for post-build natural-edge completion.
-        self.same_seated_index: list[
-            dict[tuple[EdgeRef | None, ...], set[VertexRef]]
-        ] = []
-
-        self.root_ref: VertexRef | None = None
-        self.terminal_vertices_by_winner_set: dict[frozenset[int], list[VertexRef]] = {}
-        self.coherence_checked: bool = False
-        self.tightest_margins_assigned: bool = False
+        self.simultaneous = bool(simultaneous)
+        self.store_fpv_vec = bool(store_fpv_vec)
+        super().__init__(
+            profile,
+            m,
+            LAM,
+            memory_lite=memory_lite,
+            trip_when_incoherent=trip_when_incoherent,
+        )
 
     # -----------------------------------------------------------------
     # Initial setup
     # -----------------------------------------------------------------
+
+    def _initialize_profile_data(self, profile) -> None:
+        if self._has_numpy_profile_arrays(profile):
+            self.ballot_matrix, self.root_wt_vec = (
+                self._make_padded_numpy_profile_arrays(profile)
+            )
+        else:
+            self.ballot_matrix, self.root_wt_vec = self._make_ballot_matrix(profile)
+        self.candidate_stencils = self._make_candidate_stencils(self.ballot_matrix)
+        self._unseeded_root_wt_vec = self.root_wt_vec.copy()
+
+        # Droop quota.
+        self.quota = np.floor(self.root_wt_vec.sum() / (self.m + 1)) + 1
+
+    def _initialize_graph_specific_storage(self) -> None:
+        # Index for post-build natural-edge completion.
+        self.same_seated_index: list[
+            dict[tuple[EdgeRef | None, ...], set[VertexRef]]
+        ] = []
+        self._seed_connector_ref: VertexRef | None = None
+        self.used_seeded_build = False
+        self.seed_very_strong_candidates = frozenset()
+        self.seed_strong_candidates = frozenset()
+        self.seed_weak_candidates = frozenset()
+        self.seed_frozen_mentions: NDArray[np.float64] | None = None
+
+    def _on_new_layer(self, layer: int) -> None:
+        self.same_seated_index.append(defaultdict(set))
+
+    def _record_vertex_index(self, layer: int, key: StateKey, ref: VertexRef) -> None:
+        self.same_seated_index[layer][self._same_seated_index_key(key)].add(ref)
+
+    def _same_seated_index_key(self, key: StateKey):
+        return key.seated_at
+
+    def _make_state_key(
+        self,
+        *,
+        seated_at: tuple[EdgeRef | None, ...],
+        hopefuls: frozenset[int],
+        parent_key: StateKey | None = None,
+    ) -> StateKey:
+        return StateKey(seated_at=seated_at, hopefuls=hopefuls)
+
+    def _remap_key_refs(
+        self,
+        key: StateKey,
+        edge_ref_map: dict[EdgeRef, EdgeRef],
+    ) -> StateKey:
+        seated_at = tuple(
+            None if edge_ref is None else edge_ref_map[edge_ref]
+            for edge_ref in key.seated_at
+        )
+        return self._make_state_key(
+            seated_at=seated_at,
+            hopefuls=key.hopefuls,
+            parent_key=key,
+        )
+
+    def _state_key_signature(
+        self,
+        key: StateKey,
+    ) -> tuple[tuple[tuple[int, object, int, int] | None, ...], frozenset[int]]:
+        seated_edges = tuple(
+            None if edge_ref is None else self._seating_edge_signature(edge_ref)
+            for edge_ref in key.seated_at
+        )
+        return seated_edges, key.hopefuls
+
+    def _seating_edge_signature(
+        self,
+        edge_ref: EdgeRef,
+    ) -> tuple[int, object, int, int]:
+        edge = self.edge(edge_ref)
+        parent = self.vertex(edge.src)
+        return (
+            edge.src.layer,
+            self._state_key_signature(parent.key),
+            int(edge.action),
+            int(edge.candidate),
+        )
 
     def _make_ballot_matrix(
         self,
@@ -151,6 +194,12 @@ class WIGMGraphConstructor:
 
         return stencil_list
 
+    def _make_root_key(self) -> StateKey:
+        return self._make_state_key(
+            seated_at=(None,) * self.m,
+            hopefuls=frozenset(range(self.n_candidates)),
+        )
+
     def _make_root_cache(self) -> RuntimeCache:
         bool_ballot_matrix = np.ones_like(self.ballot_matrix, dtype=np.bool_)
         pos_vec = np.zeros(bool_ballot_matrix.shape[0], dtype=np.int8)
@@ -162,108 +211,21 @@ class WIGMGraphConstructor:
             fpv_vec=fpv_vec,
         )
 
-    def initialize_root(self) -> VertexRef:
-        if self.root_ref is not None:
-            return self.root_ref
-
-        root_key = StateKey(
-            seated_at=(None,) * self.m,
-            hopefuls=frozenset(range(self.n_candidates)),
-        )
-
-        root_ref, _ = self._get_or_create_vertex(
-            layer=0,
-            key=root_key,
-            degree=0,
-        )
-
-        root = self.vertex(root_ref)
-        root.path_multiplicity = 1
-        root.tightest_margin = None
-
-        self.runtime_cache[root_ref] = self._make_root_cache()
-
-        self.root_ref = root_ref
-        self._enqueue(root_ref)
-
-        return root_ref
-
-    # -----------------------------------------------------------------
-    # Main DFS construction
-    # -----------------------------------------------------------------
-
-    def build(self) -> None:
-        """
-        Build vertices, proposal edges, tallies, and runtime caches.
-
-        This does not add all post-hoc natural edges and does not assign
-        final vertex tightest_margin values.
-        """
-        self.initialize_root()
-
-        while self.stack:
-            ref = self.stack.pop()
-            v = self.vertex(ref)
-
-            if v.status != ElectionStatus.UNEXPANDED:
-                continue
-
-            self._materialize_cache(ref)
-            self._expand_vertex(ref)
-
-    def _expand_vertex(self, ref: VertexRef) -> None:
-        v = self.vertex(ref)
-        print(f"Expanding vertex {ref} with degree {v.degree} and key {v.key}")
-
-        cache = self.runtime_cache[ref]
-        incoming_edge = self._primary_incoming_edge(ref)
-
-        wt_vec = self._wt_vec_for_vertex(v, incoming_edge)
-        v.tallies = self._compute_tallies(cache, wt_vec)
-
-        proposals = list(self._propose_children(v, cache, wt_vec))
-
-        for proposal in proposals:
-            self._add_child_from_proposal(ref, proposal)
-
-        if proposals:
-            v.status = ElectionStatus.EXPANDED
-        else:
-            v.status = ElectionStatus.TERMINAL
-
-        self._maybe_drop_cache(ref)
-
-    # -----------------------------------------------------------------
-    # Runtime cache handling
-    # -----------------------------------------------------------------
-
-    def _materialize_cache(self, ref: VertexRef) -> None:
-        if ref in self.runtime_cache:
-            return
-
-        parent_edge_ref = self.primary_parent_edge[ref]
-        parent_edge = self.edge(parent_edge_ref)
-        parent_ref = parent_edge.src
-
-        parent_cache = self.runtime_cache[parent_ref]
-
-        self.runtime_cache[ref] = self._derive_child_cache(
-            parent_cache=parent_cache,
-            incoming_edge=parent_edge,
-        )
-
-        self.pending_primary_children[parent_ref] -= 1
-        self._maybe_drop_cache(parent_ref)
-
     def _derive_child_cache(
         self,
         parent_cache: RuntimeCache,
         incoming_edge: ElectionEdge,
     ) -> RuntimeCache:
         bool_ballot_matrix = parent_cache.bool_ballot_matrix.copy()
-        bool_ballot_matrix &= self.candidate_stencils[incoming_edge.candidate]
+        if incoming_edge.action == EdgeAction.SIMULTANEOUS_ELECT:
+            removed_candidates = self._simultaneous_group_for_edge(incoming_edge)
+        else:
+            removed_candidates = (incoming_edge.candidate,)
 
-        needs_update = parent_cache.fpv_vec == incoming_edge.candidate
+        for candidate in removed_candidates:
+            bool_ballot_matrix &= self.candidate_stencils[candidate]
+
+        needs_update = np.isin(parent_cache.fpv_vec, removed_candidates)
 
         pos_vec = parent_cache.pos_vec.copy()
         pos_vec[needs_update] = bool_ballot_matrix[needs_update].argmax(axis=1)
@@ -276,39 +238,56 @@ class WIGMGraphConstructor:
             fpv_vec=fpv_vec,
         )
 
-    def _maybe_drop_cache(self, ref: VertexRef) -> None:
-        if not self.memory_lite:
-            return
+    def _simultaneous_group_for_edge(
+        self,
+        incoming_edge: ElectionEdge,
+    ) -> tuple[int, ...]:
+        if incoming_edge.action != EdgeAction.SIMULTANEOUS_ELECT:
+            return (incoming_edge.candidate,)
 
+        group = [
+            edge.candidate
+            for edge in self.edge_layers[incoming_edge.ref.layer]
+            if (
+                edge.src == incoming_edge.src
+                and edge.dst == incoming_edge.dst
+                and edge.action == EdgeAction.SIMULTANEOUS_ELECT
+            )
+        ]
+        if not group:
+            raise ValueError(
+                f"Could not recover simultaneous election group for {incoming_edge.ref}."
+            )
+
+        return tuple(group)
+
+    def _materialize_cache_from_state(self, ref: VertexRef) -> RuntimeCache:
         v = self.vertex(ref)
+        bool_ballot_matrix = np.ones_like(self.ballot_matrix, dtype=np.bool_)
 
-        if v.status == ElectionStatus.UNEXPANDED:
-            return
+        unavailable = set(range(self.n_candidates)) - set(v.key.hopefuls)
+        for candidate in unavailable:
+            bool_ballot_matrix &= self.candidate_stencils[candidate]
 
-        if self.pending_primary_children[ref] > 0:
-            return
+        pos_vec = bool_ballot_matrix.argmax(axis=1).astype(np.int8)
+        fpv_vec = self.ballot_matrix[np.arange(bool_ballot_matrix.shape[0]), pos_vec]
 
-        self.runtime_cache.pop(ref, None)
+        return RuntimeCache(
+            bool_ballot_matrix=bool_ballot_matrix,
+            pos_vec=pos_vec,
+            fpv_vec=fpv_vec,
+        )
 
     # -----------------------------------------------------------------
     # Weight-vector / tally logic
     # -----------------------------------------------------------------
-
-    def _primary_incoming_edge(self, ref: VertexRef) -> ElectionEdge | None:
-        edge_ref = self.primary_parent_edge.get(ref)
-        if edge_ref is None:
-            return None
-        return self.edge(edge_ref)
 
     def _wt_vec_for_vertex(
         self,
         v: ElectionState,
         incoming_edge: ElectionEdge | None,
     ) -> NDArray[np.float64]:
-        if incoming_edge is not None and incoming_edge.action in (
-            EdgeAction.ELECT,
-            EdgeAction.FORCE_ELECT,
-        ):
+        if incoming_edge is not None and incoming_edge.action.is_election:
             if incoming_edge.wt_vec is None:
                 raise ValueError("Election edge is missing wt_vec.")
             return incoming_edge.wt_vec
@@ -324,6 +303,15 @@ class WIGMGraphConstructor:
 
         return e.wt_vec
 
+    def _expansion_context(
+        self,
+        ref: VertexRef,
+        v: ElectionState,
+        cache: RuntimeCache,
+        incoming_edge: ElectionEdge | None,
+    ) -> NDArray[np.float64]:
+        return self._wt_vec_for_vertex(v, incoming_edge)
+
     def _latest_seating_edge(self, key: StateKey) -> EdgeRef | None:
         seating_edges = [e for e in key.seated_at if e is not None]
         if not seating_edges:
@@ -333,6 +321,7 @@ class WIGMGraphConstructor:
 
     def _compute_tallies(
         self,
+        v: ElectionState,
         cache: RuntimeCache,
         wt_vec: NDArray[np.float64],
     ) -> NDArray[np.float64]:
@@ -347,9 +336,146 @@ class WIGMGraphConstructor:
             minlength=self.n_candidates,
         ).astype(np.float64)
 
+    def _compute_tallies_from_fpv(
+        self,
+        fpv_vec: NDArray[np.integer],
+        wt_vec: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        not_exhausted_mask = fpv_vec >= 0
+        return np.bincount(
+            fpv_vec[not_exhausted_mask],
+            weights=wt_vec[not_exhausted_mask],
+            minlength=self.n_candidates,
+        ).astype(np.float64)
+
+    def _edge_fpv_vec_from_cache(
+        self,
+        cache: RuntimeCache,
+    ) -> NDArray[np.integer] | None:
+        if not self.store_fpv_vec:
+            return None
+        if cache.fpv_vec is None:
+            return None
+        return cache.fpv_vec.copy()
+
+    def _next_margin_for_vertex(
+        self,
+        v: ElectionState,
+        wt_vec: NDArray[np.float64],
+    ) -> float | None:
+        if v.tallies is None or v.degree == self.m:
+            return None
+
+        margins: list[float] = []
+
+        if np.any(v.tallies > self.quota + self.LAM):
+            highest_tally = np.max(v.tallies)
+            margins.extend(
+                float(highest_tally - tally)
+                for tally in v.tallies
+                if highest_tally - tally > self.LAM
+            )
+        elif len(v.key.hopefuls) + v.degree == self.m:
+            return None
+        else:
+            highest_tally = np.max(v.tallies)
+            election_margins = np.maximum(
+                np.maximum(highest_tally, self.quota) - v.tallies,
+                0.0,
+            )
+            margins.extend(float(m) for m in election_margins if m > self.LAM)
+
+            hopefuls = np.array(list(v.key.hopefuls), dtype=int)
+            if len(hopefuls) > 0:
+                lowest_tally = np.min(v.tallies[hopefuls])
+                elimination_margin_floor = float(max(highest_tally - self.quota, 0.0))
+                elimination_margins = np.maximum(
+                    v.tallies[hopefuls] - lowest_tally,
+                    elimination_margin_floor,
+                )
+                margins.extend(float(m) for m in elimination_margins if m > self.LAM)
+
+        if not margins:
+            return None
+        return min(margins)
+
     # -----------------------------------------------------------------
     # Child proposal logic
     # -----------------------------------------------------------------
+
+    def _updated_wt_vec_for_election_group(
+        self,
+        group: tuple[int, ...],
+        cache: RuntimeCache,
+        wt_vec: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], tuple[float, ...]]:
+        updated_wt_vec = wt_vec.copy()
+        transfer_values: list[float] = []
+
+        for candidate in group:
+            tally = float(wt_vec[cache.fpv_vec == candidate].sum())
+            if tally == 0:
+                raise ValueError(
+                    f"Cannot compute transfer value for candidate {candidate} "
+                    "with zero first-preference tally."
+                )
+            transfer_value = float((tally - self.quota) / tally)
+            transfer_values.append(transfer_value)
+            updated_wt_vec[cache.fpv_vec == candidate] *= transfer_value
+
+        return updated_wt_vec, tuple(transfer_values)
+
+    def _election_groups_within_lam(
+        self,
+        v: ElectionState,
+        *,
+        forced: bool,
+    ) -> Iterable[tuple[int, ...]]:
+        if v.tallies is None:
+            raise ValueError("Cannot choose election groups before tallies exist.")
+
+        remaining_seats = self.m - v.degree
+        if remaining_seats <= 0:
+            return ()
+
+        hopefuls = np.array(sorted(v.key.hopefuls), dtype=int)
+        if len(hopefuls) == 0:
+            return ()
+
+        highest_tally = float(np.max(v.tallies[hopefuls]))
+        within_quota = [
+            int(candidate)
+            for candidate in hopefuls
+            if v.tallies[candidate] >= self.quota - self.LAM
+        ]
+
+        if len(within_quota) > remaining_seats:
+            within_quota = [
+                candidate
+                for candidate in within_quota
+                if v.tallies[candidate] >= highest_tally - self.LAM
+            ]
+
+        required = frozenset()
+        if forced:
+            required = frozenset(
+                int(candidate)
+                for candidate in hopefuls
+                if v.tallies[candidate] > self.quota + self.LAM
+            )
+            if len(required) > remaining_seats:
+                return ()
+
+        max_group_size = min(len(within_quota), remaining_seats)
+        groups = []
+        for group_size in range(1, max_group_size + 1):
+            for group in combinations(within_quota, group_size):
+                group_set = frozenset(group)
+                if required and not required <= group_set:
+                    continue
+                groups.append(tuple(sorted(group)))
+
+        return tuple(groups)
 
     def _propose_children(
         self,
@@ -360,31 +486,60 @@ class WIGMGraphConstructor:
         if v.tallies is None:
             raise ValueError("Cannot propose children before tallies are computed.")
 
+        hopefuls = np.array(sorted(v.key.hopefuls), dtype=int)
+        if len(hopefuls) == 0:
+            return
+
         # Forced election: someone is safely above quota + LAM.
-        if np.any(v.tallies > self.quota + self.LAM):
-            highest_tally = np.max(v.tallies)
-            winner_idx_within_lam = np.where(
-                v.tallies >= highest_tally - self.LAM
-            )[0]
+        if np.any(v.tallies[hopefuls] > self.quota + self.LAM):
+            edge_fpv_vec = self._edge_fpv_vec_from_cache(cache)
+            if self.simultaneous:
+                for group in self._election_groups_within_lam(v, forced=True):
+                    updated_wt_vec, transfer_values = (
+                        self._updated_wt_vec_for_election_group(group, cache, wt_vec)
+                    )
+                    action = (
+                        EdgeAction.FORCE_ELECT
+                        if len(group) == 1
+                        else EdgeAction.SIMULTANEOUS_ELECT
+                    )
+                    yield ChildProposal(
+                        action=action,
+                        candidate=int(group[0]),
+                        transfer_value=transfer_values[0],
+                        transfer_values=transfer_values,
+                        wt_vec=updated_wt_vec,
+                        fpv_vec=edge_fpv_vec,
+                        margin=0.0,
+                        candidates=group,
+                    )
+                return
+
+            highest_tally = np.max(v.tallies[hopefuls])
+            winner_idx_within_lam = hopefuls[
+                np.where(v.tallies[hopefuls] >= highest_tally - self.LAM)[0]
+            ]
 
             for candidate in winner_idx_within_lam:
-                tally = v.tallies[candidate]
-                transfer_value = (tally - self.quota) / tally
-
-                updated_wt_vec = wt_vec.copy()
-                updated_wt_vec[cache.fpv_vec == candidate] *= transfer_value
-
+                group = (int(candidate),)
+                updated_wt_vec, transfer_values = (
+                    self._updated_wt_vec_for_election_group(group, cache, wt_vec)
+                )
                 yield ChildProposal(
                     action=EdgeAction.FORCE_ELECT,
-                    candidate=int(candidate),
-                    transfer_value=transfer_value,
+                    candidate=int(group[0]),
+                    transfer_value=transfer_values[0],
+                    transfer_values=transfer_values,
                     wt_vec=updated_wt_vec,
-                    margin=float(highest_tally - tally),
+                    fpv_vec=edge_fpv_vec,
+                    margin=float(highest_tally - v.tallies[candidate]),
+                    candidates=group,
                 )
 
         # All remaining hopefuls must be seated.
         elif len(v.key.hopefuls) + v.degree == self.m:
-            for candidate in np.array(list(v.key.hopefuls), dtype=int):
+            edge_fpv_vec = self._edge_fpv_vec_from_cache(cache)
+            for candidate in hopefuls:
                 updated_wt_vec = wt_vec.copy()
 
                 yield ChildProposal(
@@ -392,35 +547,53 @@ class WIGMGraphConstructor:
                     candidate=int(candidate),
                     transfer_value=0.0,
                     wt_vec=updated_wt_vec,
+                    fpv_vec=edge_fpv_vec,
                     margin=0.0,
                 )
 
         else:
             # Optional election edges for candidates within LAM of highest tally.
             highest_tally = np.max(v.tallies)
+            elimination_margin_floor = float(max(highest_tally - self.quota, 0.0))
             if highest_tally > self.quota - self.LAM:
-                winner_idx_within_lam = np.where(
-                    (v.tallies >= max(highest_tally, self.quota) - self.LAM)
-                )[0]
+                edge_fpv_vec = self._edge_fpv_vec_from_cache(cache)
+                if self.simultaneous:
+                    group_iter = self._election_groups_within_lam(v, forced=False)
+                else:
+                    winner_idx_within_lam = hopefuls[
+                        np.where(
+                            v.tallies[hopefuls]
+                            >= max(highest_tally, self.quota) - self.LAM
+                        )[0]
+                    ]
+                    group_iter = tuple((int(candidate),) for candidate in winner_idx_within_lam)
 
-                for candidate in winner_idx_within_lam:
-                    tally = v.tallies[candidate]
-                    transfer_value = (tally - self.quota) / tally
-
-                    updated_wt_vec = wt_vec.copy()
-                    updated_wt_vec[cache.fpv_vec == candidate] *= transfer_value
+                for group in group_iter:
+                    updated_wt_vec, transfer_values = (
+                        self._updated_wt_vec_for_election_group(group, cache, wt_vec)
+                    )
+                    group_margin = max(
+                        max(highest_tally, self.quota) - min(v.tallies[list(group)]),
+                        0.0,
+                    )
+                    action = (
+                        EdgeAction.ELECT
+                        if len(group) == 1
+                        else EdgeAction.SIMULTANEOUS_ELECT
+                    )
 
                     yield ChildProposal(
-                        action=EdgeAction.ELECT,
-                        candidate=int(candidate),
-                        transfer_value=transfer_value,
+                        action=action,
+                        candidate=int(group[0]),
+                        transfer_value=transfer_values[0],
+                        transfer_values=transfer_values,
                         wt_vec=updated_wt_vec,
-                        margin=float(max(self.quota - tally, 0.0)),
+                        fpv_vec=edge_fpv_vec,
+                        margin=float(group_margin),
+                        candidates=group,
                     )
 
             # Optional elimination edges for candidates within LAM of lowest tally.
-            hopefuls = np.array(list(v.key.hopefuls), dtype=int)
-
             if len(hopefuls) > 0:
                 lowest_tally = np.min(v.tallies[hopefuls])
                 loser_idx_within_lam = hopefuls[
@@ -428,7 +601,10 @@ class WIGMGraphConstructor:
                 ]
 
                 for candidate in loser_idx_within_lam:
-                    margin = v.tallies[candidate] - lowest_tally
+                    margin = max(
+                        v.tallies[candidate] - lowest_tally,
+                        elimination_margin_floor,
+                    )
 
                     yield ChildProposal(
                         action=EdgeAction.ELIMINATE,
@@ -440,25 +616,18 @@ class WIGMGraphConstructor:
     # Child insertion
     # -----------------------------------------------------------------
 
-    def _add_child_from_proposal(
-        self,
-        parent_ref: VertexRef,
-        proposal: ChildProposal,
-    ) -> VertexRef:
-        if proposal.action in (EdgeAction.ELECT, EdgeAction.FORCE_ELECT):
-            return self._add_election_child(parent_ref, proposal)
-
-        return self._add_elimination_child(parent_ref, proposal)
-
     def _add_election_child(
         self,
         parent_ref: VertexRef,
         proposal: ChildProposal,
     ) -> VertexRef:
+        if proposal.candidates is not None and len(proposal.candidates) > 1:
+            return self._add_simultaneous_election_child(parent_ref, proposal)
+
         parent = self.vertex(parent_ref)
         edge_layer = parent_ref.layer
 
-        # Child StateKey stores this incoming EdgeRef, so reserve it first.
+        # WIGM StateKey stores this incoming EdgeRef, so reserve it first.
         edge_ref = self._next_edge_ref(edge_layer)
 
         child_key, child_degree = self._make_child_key_and_degree(
@@ -467,7 +636,8 @@ class WIGMGraphConstructor:
             incoming_edge_ref=edge_ref,
         )
 
-        # Election children are guaranteed new.
+        # Election children are guaranteed new for WIGM because the child key
+        # includes the reserved incoming seating edge.
         child_ref = self._create_vertex_no_dedupe(
             layer=parent_ref.layer + 1,
             key=child_key,
@@ -482,6 +652,7 @@ class WIGMGraphConstructor:
             status=proposal.status,
             transfer_value=proposal.transfer_value,
             wt_vec=proposal.wt_vec,
+            fpv_vec=proposal.fpv_vec,
             margin=proposal.margin,
             forced_ref=edge_ref,
             skip_dedupe=True,
@@ -494,43 +665,103 @@ class WIGMGraphConstructor:
         if self.vertex(child_ref).status != ElectionStatus.TERMINAL:
             self.pending_primary_children[parent_ref] += 1
             self._enqueue(child_ref)
+        else:
+            self._check_incoherent_leaf_tripwire(child_ref)
 
         return child_ref
 
-    def _add_elimination_child(
+    def _add_simultaneous_election_child(
         self,
         parent_ref: VertexRef,
         proposal: ChildProposal,
     ) -> VertexRef:
+        if proposal.wt_vec is None:
+            raise ValueError("Simultaneous election proposal is missing wt_vec.")
+        if proposal.candidates is None or len(proposal.candidates) <= 1:
+            raise ValueError(
+                "Simultaneous election proposal must include multiple candidates."
+            )
+
         parent = self.vertex(parent_ref)
+        group = tuple(int(candidate) for candidate in proposal.candidates)
+        edge_layer = parent_ref.layer
 
-        child_key, child_degree = self._make_child_key_and_degree(
-            parent=parent,
-            proposal=proposal,
-            incoming_edge_ref=None,
+        first_edge_ref = self._next_edge_ref(edge_layer)
+        edge_refs = [
+            EdgeRef(edge_layer, first_edge_ref.local_id + offset)
+            for offset in range(len(group))
+        ]
+
+        new_seated_at = list(parent.key.seated_at)
+        for offset, edge_ref in enumerate(edge_refs):
+            new_seated_at[parent.degree + offset] = edge_ref
+
+        child_key = self._make_state_key(
+            seated_at=tuple(new_seated_at),
+            hopefuls=parent.key.hopefuls - set(group),
+            parent_key=parent.key,
         )
-
-        child_ref, child_is_new = self._get_or_create_vertex(
-            layer=parent_ref.layer + 1,
+        child_degree = parent.degree + len(group)
+        child_ref = self._create_vertex_no_dedupe(
+            layer=parent_ref.layer + len(group),
             key=child_key,
             degree=child_degree,
         )
 
-        edge_ref, _ = self._add_edge(
-            src=parent_ref,
-            dst=child_ref,
-            action=proposal.action,
-            candidate=proposal.candidate,
-            status=proposal.status,
-            margin=proposal.margin,
+        transfer_values = self._transfer_values_for_simultaneous_proposal(
+            group=group,
+            proposal=proposal,
         )
 
-        if child_is_new:
-            self.primary_parent_edge[child_ref] = edge_ref
+        for candidate, edge_ref, transfer_value in zip(
+            group,
+            edge_refs,
+            transfer_values,
+        ):
+            created_edge_ref, _ = self._add_edge(
+                src=parent_ref,
+                dst=child_ref,
+                action=EdgeAction.SIMULTANEOUS_ELECT,
+                candidate=candidate,
+                status=proposal.status,
+                transfer_value=transfer_value,
+                wt_vec=proposal.wt_vec,
+                fpv_vec=proposal.fpv_vec,
+                margin=proposal.margin,
+                forced_ref=edge_ref,
+                skip_dedupe=True,
+            )
+            assert created_edge_ref == edge_ref
+
+        child = self.vertex(child_ref)
+        child.path_multiplicity = parent.path_multiplicity
+        self.primary_parent_edge[child_ref] = edge_refs[0]
+
+        if child.status != ElectionStatus.TERMINAL:
             self.pending_primary_children[parent_ref] += 1
             self._enqueue(child_ref)
+        else:
+            self._check_incoherent_leaf_tripwire(child_ref)
 
         return child_ref
+
+    def _transfer_values_for_simultaneous_proposal(
+        self,
+        *,
+        group: tuple[int, ...],
+        proposal: ChildProposal,
+    ) -> tuple[float, ...]:
+        if len(group) == 0:
+            return ()
+
+        if proposal.transfer_values is None:
+            raise ValueError("Simultaneous election proposal is missing transfer values.")
+
+        transfer_values = proposal.transfer_values
+        if len(transfer_values) != len(group):
+            raise ValueError("Simultaneous transfer value count does not match group.")
+
+        return tuple(float(value) for value in transfer_values)
 
     def _make_child_key_and_degree(
         self,
@@ -540,26 +771,806 @@ class WIGMGraphConstructor:
     ) -> tuple[StateKey, int]:
         if proposal.action == EdgeAction.ELIMINATE:
             return (
-                StateKey(
+                self._make_state_key(
                     seated_at=parent.key.seated_at,
                     hopefuls=parent.key.hopefuls - {proposal.candidate},
+                    parent_key=parent.key,
                 ),
                 parent.degree,
             )
 
-        if proposal.action in (EdgeAction.ELECT, EdgeAction.FORCE_ELECT):
+        if proposal.action.is_election:
             new_seated_at = list(parent.key.seated_at)
             new_seated_at[parent.degree] = incoming_edge_ref
 
             return (
-                StateKey(
+                self._make_state_key(
                     seated_at=tuple(new_seated_at),
                     hopefuls=parent.key.hopefuls - {proposal.candidate},
+                    parent_key=parent.key,
                 ),
                 parent.degree + 1,
             )
 
         raise ValueError(f"Unknown proposal action: {proposal.action}")
+
+    # -----------------------------------------------------------------
+    # Seeded construction
+    # -----------------------------------------------------------------
+
+    def seeded_build(
+        self,
+        *,
+        weak_candidates: Iterable[int] | None = None,
+        strong_candidates: Iterable[int] | None = None,
+        very_strong_candidates: Iterable[int] | None = None,
+        already_elected: Sequence[Sequence[int | str]] | None = None,
+        transfer_values: Sequence[Sequence[float]] | None = None,
+        diagnostics: bool = True,
+        diagnostic_interval: int = 1000,
+    ):
+        """
+        Build forward from all viable seeds matching candidate filters.
+
+        A seed excludes every weak and already-elected candidate from hopefuls,
+        includes every strong candidate in hopefuls, and chooses any subset of
+        the remaining candidates as hopeful. Seeds with too few hopeful
+        candidates to fill the remaining seats are skipped.
+        """
+        if diagnostic_interval <= 0:
+            raise ValueError("diagnostic_interval must be positive.")
+
+        weak = (
+            None
+            if weak_candidates is None
+            else frozenset(int(candidate) for candidate in weak_candidates)
+        )
+        strong = (
+            None
+            if strong_candidates is None
+            else frozenset(int(candidate) for candidate in strong_candidates)
+        )
+        very_strong = frozenset(
+            int(candidate)
+            for candidate in (
+                () if very_strong_candidates is None else very_strong_candidates
+            )
+        )
+
+        if very_strong and already_elected is not None:
+            raise ValueError(
+                "very_strong_candidates cannot currently be combined with "
+                "already_elected; use one pre-seating mechanism at a time."
+            )
+        if very_strong and transfer_values is not None:
+            raise ValueError(
+                "transfer_values cannot currently be combined with "
+                "very_strong_candidates."
+            )
+
+        elected_groups = self._normalize_already_elected(already_elected)
+        already_elected_set = frozenset(
+            candidate
+            for group in elected_groups
+            for candidate in group
+        ) | very_strong
+        self._validate_seed_candidate_sets(
+            frozenset() if weak is None else weak,
+            frozenset() if strong is None else strong,
+            already_elected_set,
+        )
+        self._reset_seeded_graph_storage()
+        if diagnostics:
+            self._print_seeded_build_diagnostics(
+                "initialized",
+                detail=(
+                    f"memory_lite={self.memory_lite}, "
+                    f"candidates={self.n_candidates}, ballots={len(self.root_wt_vec)}"
+                ),
+            )
+
+        if very_strong:
+            seeded_wt_vec, seated_at, elected_groups = (
+                self._initialize_very_strong_seed(very_strong)
+            )
+            already_elected_set = frozenset(
+                candidate
+                for group in elected_groups
+                for candidate in group
+            )
+        else:
+            seeded_wt_vec, seated_at = self._initialize_already_elected_seed(
+                elected_groups=elected_groups,
+                transfer_values=transfer_values,
+            )
+        self.root_wt_vec = seeded_wt_vec
+        initial_degree = len(already_elected_set)
+        remaining_seats = self.m - initial_degree
+        if diagnostics:
+            self._print_seeded_build_diagnostics(
+                "pre-seating complete",
+                detail=(
+                    f"already_elected={len(already_elected_set)}, "
+                    f"remaining_seats={remaining_seats}"
+                ),
+            )
+
+        if strong is None:
+            strong, weak, frozen_mentions = search_strong_weak_candidates(
+                self.ballot_matrix,
+                seeded_wt_vec,
+                self.n_candidates,
+                remaining_seats=remaining_seats,
+                LAM=float(self.LAM),
+                quota=float(self.quota),
+                masked_candidates=already_elected_set,
+            )
+        elif weak is None:
+            weak, frozen_mentions = weak_candidates_from_strong(
+                self.ballot_matrix,
+                seeded_wt_vec,
+                self.n_candidates,
+                strong,
+                LAM=float(self.LAM),
+                quota=float(self.quota),
+                verify_strong=True,
+                masked_candidates=already_elected_set,
+            )
+        else:
+            frozen_mentions = frozen_mentions_from_matrix(
+                self.ballot_matrix,
+                seeded_wt_vec,
+                self.n_candidates,
+                strong,
+                masked_candidates=already_elected_set,
+            )
+
+        self._validate_seed_candidate_sets(weak, strong, already_elected_set)
+        self.used_seeded_build = True
+        self.seed_very_strong_candidates = already_elected_set & very_strong
+        self.seed_strong_candidates = strong
+        self.seed_weak_candidates = weak
+        self.seed_frozen_mentions = frozen_mentions
+        if diagnostics:
+            self._print_seeded_build_diagnostics(
+                "candidate partition complete",
+                detail=f"strong={len(strong)}, weak={len(weak)}",
+            )
+
+        if remaining_seats == 0:
+            flexible = ()
+        else:
+            flexible = tuple(
+                candidate
+                for candidate in range(self.n_candidates)
+                if (
+                    candidate not in weak
+                    and candidate not in strong
+                    and candidate not in already_elected_set
+                )
+            )
+
+        minimum_flexible = max(remaining_seats - len(strong), 0)
+        expected_seed_count = sum(
+            comb(len(flexible), subset_size)
+            for subset_size in range(minimum_flexible, len(flexible) + 1)
+        )
+        seed_report_interval = max(
+            diagnostic_interval,
+            max(expected_seed_count // 20, 1),
+        )
+        if diagnostics:
+            self._print_seeded_build_diagnostics(
+                "allocating seeds",
+                detail=(
+                    f"flexible={len(flexible)}, "
+                    f"expected_viable_seeds={expected_seed_count}"
+                ),
+            )
+
+        seed_refs: list[VertexRef] = []
+        for subset_size in range(len(flexible) + 1):
+            for subset in combinations(flexible, subset_size):
+                hopefuls = strong | frozenset(subset)
+                if len(hopefuls) < remaining_seats:
+                    continue
+
+                key = self._make_state_key(
+                    seated_at=seated_at,
+                    hopefuls=frozenset(hopefuls),
+                )
+                layer = self.n_candidates - len(hopefuls)
+                ref, is_new = self._get_or_create_vertex(
+                    layer=layer,
+                    key=key,
+                    degree=initial_degree,
+                )
+
+                if not is_new:
+                    continue
+
+                vertex = self.vertex(ref)
+                vertex.path_multiplicity = 1
+                if not self.memory_lite:
+                    self.runtime_cache[ref] = self._materialize_cache_from_state(ref)
+                self._enqueue(ref)
+                seed_refs.append(ref)
+                if (
+                    diagnostics
+                    and len(seed_refs) % seed_report_interval == 0
+                ):
+                    self._print_seeded_build_diagnostics(
+                        "allocating seeds",
+                        detail=(
+                            f"created={len(seed_refs)}/{expected_seed_count}"
+                        ),
+                    )
+
+        if not seed_refs:
+            raise ValueError("seeded_build did not produce any viable seed vertices.")
+
+        self._seed_refs = seed_refs
+        if diagnostics:
+            self._print_seeded_build_diagnostics(
+                "seed allocation complete",
+                detail=f"created={len(seed_refs)}",
+            )
+        root_key = self._make_root_key()
+        root_local = self.layer_index[0].get(root_key) if self.layers else None
+        self.root_ref = None if root_local is None else VertexRef(0, root_local)
+
+        expanded_count = 0
+        while self.stack:
+            ref = self.stack.pop()
+            v = self.vertex(ref)
+
+            if v.status != ElectionStatus.UNEXPANDED:
+                continue
+
+            self._expand_vertex(ref)
+            expanded_count += 1
+            if diagnostics and expanded_count % diagnostic_interval == 0:
+                self._print_seeded_build_diagnostics(
+                    "expanding graph",
+                    detail=f"expanded={expanded_count}",
+                )
+
+        if diagnostics:
+            self._print_seeded_build_diagnostics(
+                "construction complete",
+                detail=f"expanded={expanded_count}",
+            )
+
+        self.coherence_checked = False
+        self.tightest_margins_assigned = False
+        self.terminal_vertices_by_winner_set = {}
+
+        return self
+
+    def _print_seeded_build_diagnostics(
+        self,
+        phase: str,
+        *,
+        detail: str | None = None,
+    ) -> None:
+        memory = self._seeded_build_array_memory()
+        memory_text = ", ".join(
+            f"{name}={size / (1024 ** 2):.1f} MiB"
+            for name, size in memory.items()
+        )
+        rss = self._current_rss_mib()
+        rss_text = "unknown" if rss is None else f"{rss:.1f} MiB"
+        vertex_count = sum(len(layer) for layer in self.layers)
+        edge_count = sum(len(layer) for layer in self.edge_layers)
+
+        suffix = "" if detail is None else f"; {detail}"
+        print(
+            f"[seeded_build:{phase}] vertices={vertex_count}, edges={edge_count}, "
+            f"stack={len(self.stack)}, runtime_caches={len(self.runtime_cache)}, "
+            f"rss={rss_text}; {memory_text}{suffix}"
+        )
+        if (
+            phase == "seed allocation complete"
+            and not self.memory_lite
+            and self.runtime_cache
+        ):
+            print(
+                "[seeded_build:memory-note] Each seed currently retains a "
+                "ballot-sized runtime cache. Use memory_lite=True to reconstruct "
+                "these caches on demand instead."
+            )
+
+    def _seeded_build_array_memory(self) -> dict[str, int]:
+        def unique_nbytes(arrays) -> int:
+            seen: set[int] = set()
+            total = 0
+            for array in arrays:
+                if not isinstance(array, np.ndarray):
+                    continue
+                identity = id(array)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                total += int(array.nbytes)
+            return total
+
+        profile_arrays = unique_nbytes(
+            (self.ballot_matrix, self.root_wt_vec, self._unseeded_root_wt_vec)
+        )
+        stencil_arrays = unique_nbytes(self.candidate_stencils)
+        cache_arrays = unique_nbytes(
+            array
+            for cache in self.runtime_cache.values()
+            for array in (
+                cache.bool_ballot_matrix,
+                cache.pos_vec,
+                cache.fpv_vec,
+            )
+        )
+        edge_arrays = unique_nbytes(
+            edge.wt_vec
+            for layer in self.edge_layers
+            for edge in layer
+        )
+        tally_arrays = unique_nbytes(
+            vertex.tallies
+            for layer in self.layers
+            for vertex in layer
+        )
+        return {
+            "profile": profile_arrays,
+            "stencils": stencil_arrays,
+            "caches": cache_arrays,
+            "edge_weights": edge_arrays,
+            "tallies": tally_arrays,
+        }
+
+    def _current_rss_mib(self) -> float | None:
+        try:
+            with open("/proc/self/status", encoding="ascii") as status_file:
+                for line in status_file:
+                    if line.startswith("VmRSS:"):
+                        return float(line.split()[1]) / 1024.0
+        except OSError:
+            return None
+        return None
+
+    def _initialize_very_strong_seed(
+        self,
+        very_strong: frozenset[int],
+    ) -> tuple[
+        NDArray[np.float64],
+        tuple[EdgeRef | None, ...],
+        tuple[tuple[int, ...], ...],
+    ]:
+        wt_vec = self._unseeded_root_wt_vec.copy()
+        bool_ballot_matrix = np.ones_like(self.ballot_matrix, dtype=np.bool_)
+        pos_vec = np.zeros(self.ballot_matrix.shape[0], dtype=np.int8)
+        fpv_vec = self.ballot_matrix[np.arange(self.ballot_matrix.shape[0]), pos_vec]
+        seated_at: list[EdgeRef | None] = [None] * self.m
+        seat_idx = 0
+        anchor_ref: VertexRef | None = None
+        remaining = set(very_strong)
+        elected_groups: list[tuple[int, ...]] = []
+
+        while remaining and seat_idx < self.m:
+            tallies = self._compute_tallies_from_fpv(fpv_vec, wt_vec)
+            forced = [
+                candidate
+                for candidate in sorted(remaining)
+                if tallies[candidate] > self.quota + self.LAM
+            ]
+            if not forced:
+                break
+
+            if anchor_ref is None:
+                anchor_ref = self._make_already_elected_root_anchor()
+            anchor = self.vertex(anchor_ref)
+            anchor.tallies = tallies
+            anchor.next_margin = self._next_margin_for_vertex(anchor, wt_vec)
+
+            remaining_seats = self.m - seat_idx
+            if self.simultaneous:
+                ranked_forced = sorted(
+                    forced,
+                    key=lambda candidate: (-tallies[candidate], candidate),
+                )
+                if len(ranked_forced) > remaining_seats:
+                    warnings.warn(
+                        "More forced very-strong candidates than remaining seats; "
+                        "pre-seating the highest current tallies only.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                group = tuple(sorted(ranked_forced[:remaining_seats]))
+            else:
+                highest = max(forced, key=lambda candidate: tallies[candidate])
+                near_highest = [
+                    candidate
+                    for candidate in forced
+                    if (
+                        candidate != highest
+                        and tallies[highest] - tallies[candidate] <= self.LAM
+                    )
+                ]
+                if near_highest:
+                    warnings.warn(
+                        "Multiple very-strong candidates are forced and within "
+                        "LAM of the maximum tally; pre-seating only the highest "
+                        f"current tally candidate {highest}.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                group = (int(highest),)
+
+            group_transfer_values = self._compute_simultaneous_transfer_values(
+                group=group,
+                fpv_vec=fpv_vec,
+                wt_vec=wt_vec,
+            )
+            for candidate, transfer_value in zip(group, group_transfer_values):
+                wt_vec[fpv_vec == candidate] *= transfer_value
+
+            for candidate in group:
+                bool_ballot_matrix &= self.candidate_stencils[candidate]
+                remaining.remove(candidate)
+
+            child_ref, edge_refs = self._make_already_elected_group_vertex(
+                parent_ref=anchor_ref,
+                seated_at=seated_at,
+                group=group,
+                transfer_values=group_transfer_values,
+                wt_vec=wt_vec,
+                fpv_vec=fpv_vec,
+                degree=seat_idx + len(group),
+            )
+
+            for edge_ref in edge_refs:
+                seated_at[seat_idx] = edge_ref
+                seat_idx += 1
+
+            elected_groups.append(group)
+            anchor_ref = child_ref
+            pos_vec = bool_ballot_matrix.argmax(axis=1).astype(np.int8)
+            fpv_vec = self.ballot_matrix[
+                np.arange(self.ballot_matrix.shape[0]),
+                pos_vec,
+            ]
+            child = self.vertex(anchor_ref)
+            child.tallies = self._compute_tallies_from_fpv(fpv_vec, wt_vec)
+            child.next_margin = self._next_margin_for_vertex(child, wt_vec)
+
+        if remaining:
+            warnings.warn(
+                "Some very_strong_candidates were not pre-seated because their "
+                f"current tallies did not force election: {sorted(remaining)}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        self._seed_connector_ref = anchor_ref
+        return wt_vec, tuple(seated_at), tuple(elected_groups)
+
+    def _normalize_seed_elected_groups(
+        self,
+        *,
+        very_strong_candidates: frozenset[int],
+        already_elected: Sequence[Sequence[int | str]] | None,
+        transfer_values: Sequence[Sequence[float]] | None,
+    ) -> tuple[tuple[int, ...], ...]:
+        user_groups = self._normalize_already_elected(already_elected)
+        if not very_strong_candidates:
+            return user_groups
+
+        if transfer_values is not None:
+            raise ValueError(
+                "transfer_values cannot currently be combined with "
+                "very_strong_candidates; pass the corresponding candidates via "
+                "already_elected instead."
+            )
+
+        if self.simultaneous:
+            very_strong_groups = (tuple(sorted(very_strong_candidates)),)
+        else:
+            very_strong_groups = tuple(
+                (candidate,)
+                for candidate in sorted(very_strong_candidates)
+            )
+
+        overlap = very_strong_candidates & frozenset(
+            candidate
+            for group in user_groups
+            for candidate in group
+        )
+        if overlap:
+            raise ValueError(
+                "very_strong_candidates cannot overlap already_elected: "
+                f"{sorted(overlap)}"
+            )
+
+        return very_strong_groups + user_groups
+
+    def _validate_seed_candidate_sets(
+        self,
+        weak: frozenset[int],
+        strong: frozenset[int],
+        already_elected: frozenset[int] = frozenset(),
+    ) -> None:
+        invalid = sorted(
+            candidate
+            for candidate in weak | strong | already_elected
+            if candidate < 0 or candidate >= self.n_candidates
+        )
+        if invalid:
+            raise ValueError(f"seeded_build has invalid candidate indices: {invalid}")
+
+        overlap = weak & strong
+        if overlap:
+            raise ValueError(
+                "seeded_build candidates cannot be both weak and strong: "
+                f"{sorted(overlap)}"
+            )
+
+        elected_overlap = already_elected & (weak | strong)
+        if elected_overlap:
+            raise ValueError(
+                "seeded_build already_elected candidates cannot also be weak "
+                f"or strong: {sorted(elected_overlap)}"
+            )
+
+        if len(already_elected) > self.m:
+            raise ValueError(
+                "seeded_build already_elected contains more candidates than "
+                f"available seats: {len(already_elected)} > {self.m}"
+            )
+
+    def _normalize_already_elected(
+        self,
+        already_elected: Sequence[Sequence[int | str]] | None,
+    ) -> tuple[tuple[int, ...], ...]:
+        if already_elected is None:
+            return ()
+
+        candidate_to_index = {
+            name: idx
+            for idx, name in enumerate(self.candidate_names)
+        }
+        seen: set[int] = set()
+        groups: list[tuple[int, ...]] = []
+
+        for group in already_elected:
+            normalized_group = []
+            for candidate in group:
+                if isinstance(candidate, str):
+                    try:
+                        candidate_idx = candidate_to_index[candidate]
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"Unknown already_elected candidate name: {candidate}"
+                        ) from exc
+                else:
+                    candidate_idx = int(candidate)
+
+                if candidate_idx in seen:
+                    raise ValueError(
+                        "already_elected candidates cannot be repeated: "
+                        f"{candidate_idx}"
+                    )
+
+                seen.add(candidate_idx)
+                normalized_group.append(candidate_idx)
+
+            if not normalized_group:
+                raise ValueError("already_elected cannot contain an empty group.")
+
+            groups.append(tuple(normalized_group))
+
+        return tuple(groups)
+
+    def _initialize_already_elected_seed(
+        self,
+        *,
+        elected_groups: tuple[tuple[int, ...], ...],
+        transfer_values: Sequence[Sequence[float]] | None,
+    ) -> tuple[NDArray[np.float64], tuple[EdgeRef | None, ...]]:
+        if (
+            transfer_values is not None
+            and len(transfer_values) != len(elected_groups)
+        ):
+            raise ValueError(
+                "transfer_values must have the same number of groups as "
+                "already_elected."
+            )
+
+        wt_vec = self._unseeded_root_wt_vec.copy()
+        bool_ballot_matrix = np.ones_like(self.ballot_matrix, dtype=np.bool_)
+        pos_vec = np.zeros(self.ballot_matrix.shape[0], dtype=np.int8)
+        fpv_vec = self.ballot_matrix[np.arange(self.ballot_matrix.shape[0]), pos_vec]
+        seated_at: list[EdgeRef | None] = [None] * self.m
+        seat_idx = 0
+        anchor_ref: VertexRef | None = None
+
+        for group_idx, group in enumerate(elected_groups):
+            current_tallies = self._compute_tallies_from_fpv(fpv_vec, wt_vec)
+            if transfer_values is None:
+                group_transfer_values = self._compute_simultaneous_transfer_values(
+                    group=group,
+                    fpv_vec=fpv_vec,
+                    wt_vec=wt_vec,
+                )
+            else:
+                raw_group_transfer_values = transfer_values[group_idx]
+                if len(raw_group_transfer_values) != len(group):
+                    raise ValueError(
+                        "Each transfer_values group must match the corresponding "
+                        "already_elected group length."
+                    )
+                group_transfer_values = tuple(
+                    float(transfer_value)
+                    for transfer_value in raw_group_transfer_values
+                )
+
+            for candidate, transfer_value in zip(group, group_transfer_values):
+                wt_vec[fpv_vec == candidate] *= transfer_value
+
+            for candidate in group:
+                bool_ballot_matrix &= self.candidate_stencils[candidate]
+
+            if anchor_ref is None:
+                anchor_ref = self._make_already_elected_root_anchor()
+            anchor = self.vertex(anchor_ref)
+            anchor.tallies = current_tallies
+            anchor.next_margin = self._next_margin_for_vertex(anchor, wt_vec)
+
+            child_ref, edge_refs = self._make_already_elected_group_vertex(
+                parent_ref=anchor_ref,
+                seated_at=seated_at,
+                group=group,
+                transfer_values=group_transfer_values,
+                wt_vec=wt_vec,
+                fpv_vec=fpv_vec,
+                degree=seat_idx + len(group),
+            )
+
+            for edge_ref in edge_refs:
+                seated_at[seat_idx] = edge_ref
+                seat_idx += 1
+
+            anchor_ref = child_ref
+
+            pos_vec = bool_ballot_matrix.argmax(axis=1).astype(np.int8)
+            fpv_vec = self.ballot_matrix[
+                np.arange(self.ballot_matrix.shape[0]),
+                pos_vec,
+            ]
+            child = self.vertex(anchor_ref)
+            child.tallies = self._compute_tallies_from_fpv(fpv_vec, wt_vec)
+            child.next_margin = self._next_margin_for_vertex(child, wt_vec)
+
+        self._seed_connector_ref = anchor_ref
+
+        return wt_vec, tuple(seated_at)
+
+    def _make_already_elected_root_anchor(self) -> VertexRef:
+        anchor_ref, _ = self._get_or_create_vertex(
+            layer=0,
+            key=self._make_root_key(),
+            degree=0,
+        )
+        anchor = self.vertex(anchor_ref)
+        anchor.status = ElectionStatus.EXPANDED
+        anchor.path_multiplicity = 0
+        return anchor_ref
+
+    def _make_already_elected_group_vertex(
+        self,
+        *,
+        parent_ref: VertexRef,
+        seated_at: list[EdgeRef | None],
+        group: tuple[int, ...],
+        transfer_values: tuple[float, ...],
+        wt_vec: NDArray[np.float64],
+        fpv_vec: NDArray[np.integer] | None = None,
+        degree: int,
+    ) -> tuple[VertexRef, list[EdgeRef]]:
+        parent = self.vertex(parent_ref)
+        next_seated_at = list(seated_at)
+        first_edge_ref = self._next_edge_ref(parent_ref.layer)
+        edge_refs = [
+            EdgeRef(parent_ref.layer, first_edge_ref.local_id + offset)
+            for offset in range(len(group))
+        ]
+
+        for offset, edge_ref in enumerate(edge_refs):
+            next_seated_at[parent.degree + offset] = edge_ref
+
+        child_ref = self._create_vertex_no_dedupe(
+            layer=parent_ref.layer + len(group),
+            key=self._make_state_key(
+                seated_at=tuple(next_seated_at),
+                hopefuls=parent.key.hopefuls - set(group),
+                parent_key=parent.key,
+            ),
+            degree=degree,
+        )
+        child = self.vertex(child_ref)
+        child.status = ElectionStatus.EXPANDED
+        child.path_multiplicity = 0
+
+        action = (
+            EdgeAction.FORCE_ELECT
+            if len(group) == 1
+            else EdgeAction.SIMULTANEOUS_ELECT
+        )
+
+        for candidate, transfer_value, edge_ref in zip(
+            group,
+            transfer_values,
+            edge_refs,
+        ):
+            edge_ref, _ = self._add_edge(
+                src=parent_ref,
+                dst=child_ref,
+                action=action,
+                candidate=candidate,
+                status=EdgeStatus.CANONICAL,
+                transfer_value=transfer_value,
+                wt_vec=wt_vec.copy(),
+                fpv_vec=(
+                    None
+                    if fpv_vec is None or not self.store_fpv_vec
+                    else fpv_vec.copy()
+                ),
+                margin=0.0,
+                forced_ref=edge_ref,
+                skip_dedupe=True,
+            )
+
+        child.path_multiplicity = 0
+        return child_ref, edge_refs
+
+    def _compute_simultaneous_transfer_values(
+        self,
+        *,
+        group: tuple[int, ...],
+        fpv_vec: NDArray[np.integer],
+        wt_vec: NDArray[np.float64],
+    ) -> tuple[float, ...]:
+        transfer_values = []
+
+        for candidate in group:
+            tally = float(wt_vec[fpv_vec == candidate].sum())
+            if tally == 0:
+                raise ValueError(
+                    "Cannot compute transfer value for already_elected candidate "
+                    f"{candidate} with zero first-preference tally."
+                )
+
+            transfer_values.append(float((tally - self.quota) / tally))
+
+        return tuple(transfer_values)
+
+    def _reset_seeded_graph_storage(self) -> None:
+        self.layers = []
+        self.edge_layers = []
+        self.layer_index = []
+        self.edge_by_ref = {}
+        self.edge_lookup = {}
+        self.stack.clear()
+        self.enqueued = set()
+        self._deferred_enqueue_refs = None
+        self.runtime_cache = {}
+        self.primary_parent_edge = {}
+        self.pending_primary_children.clear()
+        self.root_ref = None
+        self.terminal_vertices_by_winner_set = {}
+        self.coherence_checked = False
+        self.tightest_margins_assigned = False
+        self._terminal_winner_set_tripwire = None
+        self._pending_incoherent_leaf_error = None
+        self._seed_refs = []
+        self._seed_connector_ref = None
+        self._initialize_graph_specific_storage()
 
     # -----------------------------------------------------------------
     # Post-build natural edges and tightest margins
@@ -582,7 +1593,7 @@ class WIGMGraphConstructor:
 
             for parent in layer:
                 candidates = self.same_seated_index[next_layer_idx].get(
-                    parent.key.seated_at,
+                    self._same_seated_index_key(parent.key),
                     set(),
                 )
 
@@ -609,199 +1620,14 @@ class WIGMGraphConstructor:
 
                     if edge_is_new:
                         n_added += 1
-                        if parent.status == ElectionStatus.TERMINAL:
+                        if (
+                            parent.status == ElectionStatus.TERMINAL
+                            and parent.degree < self.m
+                        ):
                             parent.status = ElectionStatus.EXPANDED
 
         return n_added
 
-    def assign_tightest_margins(self) -> None:
-        """
-        Fill vertex.tightest_margin layer-by-layer from edge margins.
-
-        For each incoming edge e: parent -> child, the value offered to child is
-
-            max(e.margin, parent.tightest_margin)
-
-        The child takes the minimum over all incoming edges.
-        """
-        if self.root_ref is None:
-            raise ValueError("Cannot assign margins before root is initialized.")
-
-        for layer in self.layers:
-            for v in layer:
-                v.tightest_margin = None
-
-        root = self.vertex(self.root_ref)
-        root.tightest_margin = 0.0
-
-        for edge_layer in self.edge_layers:
-            for edge in edge_layer:
-                parent = self.vertex(edge.src)
-                child = self.vertex(edge.dst)
-
-                if parent.tightest_margin is None:
-                    continue
-
-                if edge.margin is None:
-                    raise ValueError(f"Edge {edge.ref} has no margin assigned.")
-
-                candidate_margin = max(edge.margin, parent.tightest_margin)
-
-                if child.tightest_margin is None:
-                    child.tightest_margin = candidate_margin
-                else:
-                    child.tightest_margin = min(
-                        child.tightest_margin,
-                        candidate_margin,
-                    )
-
-        self.tightest_margins_assigned = True
-
-    # -----------------------------------------------------------------
-    # Low-level graph storage
-    # -----------------------------------------------------------------
-
-    def _get_or_create_vertex(
-        self,
-        layer: int,
-        key: StateKey,
-        degree: int,
-    ) -> tuple[VertexRef, bool]:
-        self._ensure_layer(layer)
-
-        existing = self.layer_index[layer].get(key)
-        if existing is not None:
-            return VertexRef(layer, existing), False
-
-        ref = VertexRef(layer, len(self.layers[layer]))
-
-        v = ElectionState(
-            ref=ref,
-            key=key,
-            degree=degree,
-            tightest_margin=None,
-        )
-
-        self.layers[layer].append(v)
-        self.layer_index[layer][key] = ref.local_id
-        self.same_seated_index[layer][key.seated_at].add(ref)
-
-        return ref, True
-
-    def _initial_status_for_degree(self, degree: int) -> ElectionStatus:
-        if degree == self.m:
-            return ElectionStatus.TERMINAL
-        return ElectionStatus.UNEXPANDED
-
-    def _create_vertex_no_dedupe(
-        self,
-        layer: int,
-        key: StateKey,
-        degree: int,
-    ) -> VertexRef:
-        self._ensure_layer(layer)
-
-        if key in self.layer_index[layer]:
-            raise ValueError("Election child unexpectedly already exists.")
-
-        ref = VertexRef(layer, len(self.layers[layer]))
-
-        v = ElectionState(
-            ref=ref,
-            key=key,
-            degree=degree,
-            status=self._initial_status_for_degree(degree),
-            tightest_margin=None,
-        )
-
-        self.layers[layer].append(v)
-        self.layer_index[layer][key] = ref.local_id
-        self.same_seated_index[layer][key.seated_at].add(ref)
-
-        return ref
-
-    def _add_edge(
-        self,
-        *,
-        src: VertexRef,
-        dst: VertexRef,
-        action: EdgeAction,
-        candidate: int,
-        status: EdgeStatus = EdgeStatus.DEFAULT,
-        transfer_value: float | None = None,
-        wt_vec: NDArray[np.float64] | None = None,
-        margin: float | None = None,
-        forced_ref: EdgeRef | None = None,
-        skip_dedupe: bool = False,
-    ) -> tuple[EdgeRef, bool]:
-        lookup_key = (src, dst, action, candidate)
-
-        if not skip_dedupe:
-            existing = self.edge_lookup.get(lookup_key)
-            if existing is not None:
-                edge = self.edge(existing)
-                edge.status = max(edge.status, status)
-
-                if edge.margin is None and margin is not None:
-                    edge.margin = margin
-
-                return existing, False
-
-        layer = src.layer
-        self._ensure_edge_layer(layer)
-
-        ref = forced_ref if forced_ref is not None else self._next_edge_ref(layer)
-
-        if ref.local_id != len(self.edge_layers[layer]):
-            raise ValueError("forced_ref is not the next available edge ref.")
-
-        edge = ElectionEdge(
-            ref=ref,
-            src=src,
-            dst=dst,
-            action=action,
-            candidate=candidate,
-            status=status,
-            transfer_value=transfer_value,
-            wt_vec=wt_vec,
-            margin=margin,
-        )
-
-        self.edge_layers[layer].append(edge)
-        self.edge_by_ref[ref] = edge
-        self.edge_lookup[lookup_key] = ref
-
-        self.vertex(dst).path_multiplicity += self.vertex(src).path_multiplicity
-
-        return ref, True
-
-    def _next_edge_ref(self, layer: int) -> EdgeRef:
-        self._ensure_edge_layer(layer)
-        return EdgeRef(layer=layer, local_id=len(self.edge_layers[layer]))
-
-    def _enqueue(self, ref: VertexRef) -> None:
-        if ref in self.enqueued:
-            return
-
-        self.stack.append(ref)
-        self.enqueued.add(ref)
-
-    def _ensure_layer(self, layer: int) -> None:
-        while len(self.layers) <= layer:
-            self.layers.append([])
-            self.layer_index.append({})
-            self.same_seated_index.append(defaultdict(set))
-
-    def _ensure_edge_layer(self, layer: int) -> None:
-        while len(self.edge_layers) <= layer:
-            self.edge_layers.append([])
-
-    def vertex(self, ref: VertexRef) -> ElectionState:
-        return self.layers[ref.layer][ref.local_id]
-
-    def edge(self, ref: EdgeRef) -> ElectionEdge:
-        return self.edge_by_ref[ref]
-    
     # -----------------------------------------------------------------
     # Post-Construction analysis and utilities
     # -----------------------------------------------------------------
@@ -818,266 +1644,6 @@ class WIGMGraphConstructor:
 
         return frozenset(winners)
 
-
-    def coherence_check(self) -> bool:
-        """
-        Check whether all TERMINAL vertices have the same unordered winner set.
-
-        Also stores:
-            self.terminal_vertices_by_winner_set
-        """
-        terminal_winner_sets: dict[frozenset[int], list[VertexRef]] = defaultdict(list)
-
-        for layer in self.layers:
-            for v in layer:
-                if v.status != ElectionStatus.TERMINAL:
-                    continue
-
-                winner_set = self._winner_set_for_vertex(v)
-                terminal_winner_sets[winner_set].append(v.ref)
-
-        # Sort refs for stable reporting.
-        self.terminal_vertices_by_winner_set = {
-            winner_set: sorted(refs, key=lambda r: (r.layer, r.local_id))
-            for winner_set, refs in terminal_winner_sets.items()
-        }
-
-        self.coherence_checked = True
-
-        if not self.terminal_vertices_by_winner_set:
-            print("Coherence check failed: no TERMINAL vertices found.")
-            return False
-
-        if len(self.terminal_vertices_by_winner_set) == 1:
-            winner_set = next(iter(self.terminal_vertices_by_winner_set))
-            winner_names = [self.candidate_names[i] for i in sorted(winner_set)]
-            n_terminal = sum(len(refs) for refs in self.terminal_vertices_by_winner_set.values())
-
-            print("Coherence check passed.")
-            print(f"  terminal vertices: {n_terminal}")
-            print(f"  winner set: {winner_names}")
-            return True
-
-        winner_sets = list(self.terminal_vertices_by_winner_set.keys())
-
-        shared = set(winner_sets[0])
-        for winner_set in winner_sets[1:]:
-            shared &= set(winner_set)
-
-        shared_names = [self.candidate_names[i] for i in sorted(shared)]
-
-        print("Coherence check failed.")
-        print(f"  distinct terminal winner sets: {len(self.terminal_vertices_by_winner_set)}")
-        print(f"  candidates shared by all winner sets: {shared_names}")
-
-        for winner_set, refs in self.terminal_vertices_by_winner_set.items():
-            full_names = [self.candidate_names[i] for i in sorted(winner_set)]
-            completion = sorted(set(winner_set) - shared)
-            completion_names = [self.candidate_names[i] for i in completion]
-            labels = [self.vertex_label(ref) for ref in refs]
-
-            print()
-            print(f"  winner set: {full_names}")
-            print(f"    completion beyond shared core: {completion_names}")
-            print(f"    terminal node count: {len(refs)}")
-            print(f"    terminal nodes: {labels}")
-
-        return False
-    
-    def _layer_alpha(self, layer: int) -> str:
-        """
-        Convert internal layer index to an Excel-style label.
-
-        Internal layer 0 -> A
-        Internal layer 1 -> B
-        ...
-        Internal layer 25 -> Z
-        Internal layer 26 -> AA
-        """
-        n = layer + 1
-        letters = []
-
-        while n > 0:
-            n, rem = divmod(n - 1, 26)
-            letters.append(chr(ord("A") + rem))
-
-        return "".join(reversed(letters))
-
-
-    def _alpha_layer(self, alpha: str) -> int:
-        """
-        Inverse of _layer_alpha.
-        """
-        n = 0
-
-        for ch in alpha.upper():
-            if not ("A" <= ch <= "Z"):
-                raise ValueError(f"Invalid layer label character: {ch}")
-            n = 26 * n + (ord(ch) - ord("A") + 1)
-
-        return n - 1
-
-
-    def vertex_label(self, ref: VertexRef) -> str:
-        """
-        Canonical visual label for a vertex.
-        """
-        return f"{self._layer_alpha(ref.layer)}{ref.local_id}"
-
-
-    def parse_vertex_label(self, label: str) -> VertexRef:
-        """
-        Parse labels like A0, B13, AA4 into VertexRef objects.
-        """
-        label = label.strip().upper()
-
-        split = 0
-        while split < len(label) and label[split].isalpha():
-            split += 1
-
-        if split == 0 or split == len(label):
-            raise ValueError(f"Invalid vertex label: {label}")
-
-        alpha = label[:split]
-        local_id_str = label[split:]
-
-        layer = self._alpha_layer(alpha)
-        local_id = int(local_id_str)
-
-        return VertexRef(layer=layer, local_id=local_id)
-
-
-    def lookup_vertex(self, label: str) -> ElectionState:
-        """
-        Print and return the vertex corresponding to a canonical label like A0 or AA12.
-        """
-        ref = self.parse_vertex_label(label)
-        v = self.vertex(ref)
-
-        print(f"Vertex {label.upper()}")
-        print(f"  ref: {v.ref}")
-        print(f"  status: {v.status.name if hasattr(v.status, 'name') else v.status}")
-        print(f"  degree: {v.degree}")
-        print(f"  color: {v.color}")
-        print(f"  path_multiplicity: {v.path_multiplicity}")
-        print(f"  tightest_margin: {v.tightest_margin}")
-
-        winners = []
-        for edge_ref in v.key.seated_at:
-            if edge_ref is None:
-                continue
-            edge = self.edge(edge_ref)
-            winners.append((edge.candidate, self.candidate_names[edge.candidate], edge_ref))
-
-        print("  seated winners:")
-        for cand_idx, cand_name, edge_ref in winners:
-            print(f"    {cand_idx}: {cand_name} via {edge_ref}")
-
-        hopefuls = sorted(v.key.hopefuls)
-        print("  hopefuls:")
-        for cand_idx in hopefuls:
-            print(f"    {cand_idx}: {self.candidate_names[cand_idx]}")
-
-        if v.tallies is not None:
-            print("  tallies:")
-            for i, tally in enumerate(v.tallies):
-                print(f"    {i}: {self.candidate_names[i]} -> {tally}")
-
-        return v
-
-    def _zero_margin_edge_from_parent(
-        self,
-        parent_ref: VertexRef,
-        *,
-        preferred_action: EdgeAction | None = None,
-        tol: float = 1e-9,
-    ) -> ElectionEdge | None:
-        edges = self.outgoing_edges(parent_ref)
-
-        zero_edges = [
-            edge
-            for edge in edges
-            if edge.margin is not None and abs(edge.margin) <= tol
-        ]
-
-        if preferred_action is not None:
-            same_action = [
-                edge for edge in zero_edges
-                if edge.action == preferred_action
-            ]
-            if same_action:
-                zero_edges = same_action
-
-        if not zero_edges:
-            return None
-
-        # Prefer canonical/normal if those statuses exist.
-        canonical = [
-            edge for edge in zero_edges
-            if edge.status == EdgeStatus.CANONICAL
-        ]
-        if canonical:
-            return canonical[0]
-
-        normal = [
-            edge for edge in zero_edges
-            if edge.status == EdgeStatus.NORMAL
-        ]
-        if normal:
-            return normal[0]
-
-        return zero_edges[0]
-
-    def incoming_edges(self, ref: VertexRef) -> list[ElectionEdge]:
-        if ref.layer == 0:
-            return []
-
-        edge_layer_idx = ref.layer - 1
-        if edge_layer_idx >= len(self.edge_layers):
-            return []
-
-        return [
-            edge
-            for edge in self.edge_layers[edge_layer_idx]
-            if edge.dst == ref
-        ]
-
-
-    def outgoing_edges(self, ref: VertexRef) -> list[ElectionEdge]:
-        if ref.layer >= len(self.edge_layers):
-            return []
-
-        return [
-            edge
-            for edge in self.edge_layers[ref.layer]
-            if edge.src == ref
-        ]
-
-
-    def _action_word(self, action: EdgeAction) -> str:
-        if action in (EdgeAction.ELECT, EdgeAction.FORCE_ELECT):
-            return "elected"
-        if action == EdgeAction.ELIMINATE:
-            return "eliminated"
-        return str(action)
-    
-    def _action_symbol(self, action: EdgeAction) -> str:
-        if action in (EdgeAction.ELECT, EdgeAction.FORCE_ELECT):
-            return "+"
-        if action == EdgeAction.ELIMINATE:
-            return "x"
-        return "?"
-    
-    def _elected_indices_for_vertex(self, v: ElectionState) -> list[int]:
-        elected = []
-
-        for edge_ref in v.key.seated_at:
-            if edge_ref is None:
-                continue
-            elected.append(self.edge(edge_ref).candidate)
-
-        return sorted(elected)
-    
     def _transfer_value_for_seating_edge(self, edge_ref: EdgeRef) -> float | None:
         """
         Return the transfer value associated with a seating edge.
@@ -1119,185 +1685,3 @@ class WIGMGraphConstructor:
             elected.append((edge.candidate, tv))
 
         return sorted(elected, key=lambda x: x[0])
-
-    def find_minimal_upset_path(
-        self,
-        recorded_winner_set: set[int] | frozenset[int] | None = None,
-        *,
-        tol: float = 1e-9,
-        verbose = False
-    ) -> list[EdgeRef]:
-        """
-        Find a root-to-terminal path to a terminal vertex with a different winner
-        set than the recorded one, minimizing terminal tightest_margin.
-
-        If recorded_winner_set is None, infer it as the terminal winner set with
-        the smallest tightest_margin. In normal use this should be the recorded
-        winner set with margin 0.
-        """
-        if not self.coherence_checked:
-            self.coherence_check()
-
-        if not self.tightest_margins_assigned:
-            self.assign_tightest_margins()
-
-        if not self.terminal_vertices_by_winner_set:
-            raise ValueError("No terminal vertices available.")
-
-        # Infer recorded winner set if needed.
-        if recorded_winner_set is None:
-            best_recorded_key = None
-            best_recorded_margin = float("inf")
-
-            for winner_set, refs in self.terminal_vertices_by_winner_set.items():
-                margins = [
-                    self.vertex(ref).tightest_margin
-                    for ref in refs
-                    if self.vertex(ref).tightest_margin is not None
-                ]
-
-                if not margins:
-                    continue
-
-                winner_set_margin = min(margins)
-
-                if winner_set_margin < best_recorded_margin:
-                    best_recorded_margin = winner_set_margin
-                    best_recorded_key = winner_set
-
-            if best_recorded_key is None:
-                raise ValueError("Could not infer recorded winner set.")
-
-            recorded_winner_set = best_recorded_key
-        else:
-            recorded_winner_set = frozenset(recorded_winner_set)
-
-        # Find terminal upset vertex with smallest tightest_margin.
-        best_ref = None
-        best_margin = float("inf")
-        best_winner_set = None
-
-        for winner_set, refs in self.terminal_vertices_by_winner_set.items():
-            if winner_set == recorded_winner_set:
-                continue
-
-            for ref in refs:
-                v = self.vertex(ref)
-
-                if v.tightest_margin is None:
-                    continue
-
-                if v.tightest_margin < best_margin:
-                    best_margin = v.tightest_margin
-                    best_ref = ref
-                    best_winner_set = winner_set
-
-        if best_ref is None:
-            raise ValueError("No upset terminal vertex found.")
-
-        # Walk backwards from terminal to root.
-        path_edges_reversed: list[EdgeRef] = []
-        current_ref = best_ref
-
-        while current_ref != self.root_ref:
-            incoming = self.incoming_edges(current_ref)
-
-            if not incoming:
-                raise ValueError(f"Vertex {current_ref} has no incoming edges.")
-
-            def edge_score(edge: ElectionEdge) -> float:
-                parent = self.vertex(edge.src)
-
-                if parent.tightest_margin is None:
-                    return float("inf")
-
-                if edge.margin is None:
-                    return float("inf")
-
-                return max(edge.margin, parent.tightest_margin)
-
-            best_edge = min(incoming, key=edge_score)
-            path_edges_reversed.append(best_edge.ref)
-            current_ref = best_edge.src
-
-        path_edges = list(reversed(path_edges_reversed))
-
-        recorded_names = [
-            self.candidate_names[i]
-            for i in sorted(recorded_winner_set)
-        ]
-        upset_names = [
-            self.candidate_names[i]
-            for i in sorted(best_winner_set)
-        ]
-
-        print("Minimal upset path found.")
-        print(f"  recorded winner set: {recorded_names}")
-        print(f"  upset winner set:    {upset_names}")
-        print(f"  terminal vertex:     {self.vertex_label(best_ref)}")
-        print(f"  tightest_margin:     {best_margin}")
-
-        print()
-        print("Nonzero-margin steps:")
-
-        any_nonzero = False
-
-        for i, edge_ref in enumerate(path_edges, start=1):
-            edge = self.edge(edge_ref)
-
-            if edge.margin is None or abs(edge.margin) <= tol:
-                continue
-
-            any_nonzero = True
-
-            parent_ref = edge.src
-            comparison_edge = self._zero_margin_edge_from_parent(
-                parent_ref,
-                preferred_action=edge.action,
-                tol=tol,
-            )
-
-            if verbose:
-                x_name = self.candidate_names[edge.candidate]
-                x_action = self._action_word(edge.action)
-
-                if comparison_edge is None:
-                    y_phrase = "the zero-margin candidate could not be identified"
-                else:
-                    y_name = self.candidate_names[comparison_edge.candidate]
-                    y_action = self._action_word(comparison_edge.action)
-                    y_phrase = f"candidate {y_name} should have been {y_action}"
-
-                print(
-                    f"  in round {i}, candidate {x_name} was {x_action}, "
-                    f"whereas {y_phrase}, "
-                    f"corresponding to an upset of {edge.margin} ballots"
-                )
-
-            else:
-                x_sym = self._action_symbol(edge.action)
-                x_idx = edge.candidate
-
-                if comparison_edge is None:
-                    y_part = "? ?"
-                else:
-                    y_sym = self._action_symbol(comparison_edge.action)
-                    y_idx = comparison_edge.candidate
-                    y_part = f"{y_sym} {y_idx}"
-
-                parent = self.vertex(edge.src)
-
-                hopefuls = sorted(parent.key.hopefuls)
-                elected_summary = self._elected_summary_for_vertex(parent)
-
-                print(
-                    f"round {i}: {x_sym} {x_idx} instead of {y_part}. "
-                    f"M = {edge.margin}"
-                )
-                print(f"  hopefuls = {hopefuls}")
-                print(f"  elected = {elected_summary}")
-
-        if not any_nonzero:
-            print("  none")
-
-        return path_edges

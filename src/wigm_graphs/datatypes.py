@@ -1,97 +1,89 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Optional
+from dataclasses import dataclass
+from typing import Hashable, Optional
+
 import numpy as np
 from numpy.typing import NDArray
-from enum import IntEnum, IntFlag
 
-# ------------------------------ VERTICES ------------------------------
+try:
+    from ..election_graphs.datatypes import (
+        EdgeAction,
+        EdgeRef,
+        EdgeStatus,
+        ElectionEdge,
+        ElectionState,
+        ElectionStatus,
+        VertexRef,
+    )
+except ImportError:
+    from election_graphs.datatypes import (
+        EdgeAction,
+        EdgeRef,
+        EdgeStatus,
+        ElectionEdge,
+        ElectionState,
+        ElectionStatus,
+        VertexRef,
+    )
 
-@dataclass(frozen=True, slots=True)
-class VertexRef:
-    """
-    Stable reference to a vertex in the layered DAG.
-    """
-    layer: int
-    local_id: int
 
 @dataclass(frozen=True, slots=True)
 class StateKey:
     seated_at: tuple[Optional[EdgeRef], ...]
     hopefuls: frozenset[int]
 
-class ElectionStatus(IntEnum):
-    UNEXPANDED = 0
-    EXPANDED = 1
-    TERMINAL = 2
 
-    @property
-    def label(self) -> str:
-        return self.name.lower()
+@dataclass(frozen=True, slots=True)
+class BlackBoxStateKey:
+    seated_at: tuple[Optional[EdgeRef], ...]
+    hopefuls: frozenset[int]
+    seed_id: int
 
-    @property
-    def description(self) -> str:
-        return {
-            ElectionStatus.UNEXPANDED: "created but not yet expanded",
-            ElectionStatus.EXPANDED: "outgoing edges have been generated",
-            ElectionStatus.TERMINAL: "leaf/final state; no outgoing edges",
-        }[self]
-    
-@dataclass(slots=True, eq=False)
-class ElectionState:
-    ref: VertexRef
-    key: StateKey
-    degree: int
 
-    tallies: NDArray[np.float64] | None = None
-    status: ElectionStatus = ElectionStatus.UNEXPANDED
-
-    color: int | None = None
-
-    path_multiplicity: int = 0
-    tightest_margin: float | None = None
+@dataclass(slots=True)
+class WIGMWeightScenarios:
+    values: NDArray[np.float64]
+    labels: tuple[Hashable, ...]
 
     def __post_init__(self) -> None:
-        if self.color is None:
-            self.color = self.degree
+        if self.values.ndim != 2:
+            raise ValueError("Weight scenarios must have shape (scenarios, ballots).")
+        if self.values.shape[0] != len(self.labels):
+            raise ValueError("Weight scenario labels must match the scenario count.")
 
 
-# ------------------------------ EDGES ------------------------------
+@dataclass(slots=True)
+class PostSeedTallies:
+    certain: NDArray[np.float64]
+    uncertain: NDArray[np.float64]
+
+    def __post_init__(self) -> None:
+        if self.certain.ndim != 2:
+            raise ValueError("Certain tallies must have shape (scenarios, candidates).")
+        if self.uncertain.ndim != 1:
+            raise ValueError("Uncertain tallies must be one-dimensional.")
+        if self.certain.shape[1] != len(self.uncertain):
+            raise ValueError("Certain and uncertain tally candidate counts must match.")
+
+    @property
+    def lower(self) -> NDArray[np.float64]:
+        return self.certain.min(axis=0)
+
+    @property
+    def upper(self) -> NDArray[np.float64]:
+        return self.certain.max(axis=0) + self.uncertain
 
 
 @dataclass(frozen=True, slots=True)
-class EdgeRef:
-    layer: int      # edge layer: k means layer k -> k+1
-    local_id: int
-
-
-class EdgeStatus(IntEnum):
-    DEFAULT = 0
-    NORMAL = 1
-    CANONICAL = 2
-
-
-class EdgeAction(IntEnum):
-    ELECT = 0
-    ELIMINATE = 1
-    FORCE_ELECT = 2
-
-@dataclass(slots=True)
-class ElectionEdge:
-    ref: EdgeRef
-    src: VertexRef
-    dst: VertexRef
-
-    action: EdgeAction          # ELECT or ELIMINATE
+class BlackBoxElectionData:
     candidate: int
-    status: EdgeStatus = EdgeStatus.DEFAULT
-
-    margin: float | None = None
-
-    # Meaningful mainly for ELECT edges
-    transfer_value: float | None = None
-    wt_vec: NDArray[np.float64] | None = None
+    very_strong_candidates: frozenset[int]
+    strong_candidates: frozenset[int]
+    weak_candidates: frozenset[int]
+    raw_maximum_surplus: float
+    maximum_surplus: float
+    maximum_transfer_value: float
 
 
 @dataclass(slots=True)
@@ -102,3 +94,20 @@ class WIGMRuntimeCache:
     bool_ballot_matrix: NDArray[np.bool_]
     pos_vec: NDArray[np.integer]
     fpv_vec: NDArray[np.integer] | None = None
+
+
+__all__ = [
+    "EdgeAction",
+    "EdgeRef",
+    "EdgeStatus",
+    "ElectionEdge",
+    "ElectionState",
+    "ElectionStatus",
+    "BlackBoxStateKey",
+    "BlackBoxElectionData",
+    "PostSeedTallies",
+    "StateKey",
+    "VertexRef",
+    "WIGMRuntimeCache",
+    "WIGMWeightScenarios",
+]
