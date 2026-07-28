@@ -13,7 +13,9 @@ from src.test_processes import (
     CobraMentionsNoiseFilterCompiler,
     CobraNoiseFilterCompiler,
     CobraQuotaCompilerV2,
+    CobraQuotaNoiseFilterCompiler,
     CriticalMarginType,
+    GlobalAuditDriver,
     GlobalAuditDriverV2,
     ImplicitSampler,
     VertexInterpreter,
@@ -514,6 +516,52 @@ def test_global_audit_driver_v2_initializes_pairs_and_tracks_discrepancies():
     assert driver.i > 0
     assert driver.discrepancies
     assert all(len(item) == 5 for item in driver.discrepancies)
+
+
+def test_global_audit_driver_noise_filters_use_escape_critical_margins():
+    graph = build_synthetic_graph()
+    driver = GlobalAuditDriver(
+        graph,
+        noise_level=0.1,
+        sample_size=5,
+        seed=23,
+        compiler_type="noise",
+        print_diagnostics_every=0,
+        simultaneous=True,
+    )
+
+    assert driver.compiler_type == "noise"
+    assert driver.compilers
+    assert all(
+        isinstance(
+            compiler,
+            (CobraNoiseFilterCompiler, CobraQuotaNoiseFilterCompiler),
+        )
+        for compiler in driver.compilers
+    )
+    assert {compiler.LAM for compiler in driver.compilers} == {float(graph.LAM)}
+    assert all(
+        compiler.radius == pytest.approx(2.0 * compiler.critical_margin)
+        for compiler in driver.compilers
+    )
+    for compiler, info in zip(driver.compilers, driver.compiler_info):
+        vertex = graph.layers[info.base_layer][info.base_local_id]
+        escape_margin = driver._noise_filter_margin(
+            vertex,
+            info.candidate,
+            info.action,
+            simultaneous=True,
+        )["margin"]
+        if isinstance(compiler, CobraNoiseFilterCompiler):
+            assert compiler.critical_margin == pytest.approx(escape_margin / 2.0)
+        else:
+            assert isinstance(compiler, CobraQuotaNoiseFilterCompiler)
+            assert compiler.critical_margin == pytest.approx(escape_margin)
+    assert all(not info.escape_id.endswith("-N") for info in driver.compiler_info)
+
+    driver.run(ballot_matrix=graph.ballot_matrix, num_steps=1)
+    assert driver.i == 1
+    assert {compiler.num_updates for compiler in driver.compilers} == {1}
 
 
 def test_global_audit_driver_v2_builds_one_forced_elimination_compiler_per_vertex(

@@ -47,6 +47,13 @@ class EscapeCompilerInfo:
 
 
 class GlobalAuditDriver:
+    """Audit every missing graph edge with COBRA assertions or noise filters.
+
+    Set ``compiler_type="noise"`` to replace each assertion compiler with a
+    local noise-filter compiler. Candidate-to-candidate noise budgets are half
+    the escape margin; all other margin types use the full escape margin.
+    """
+
     def __init__(
         self,
         audit_graph: Any,
@@ -66,12 +73,17 @@ class GlobalAuditDriver:
         BAL: NDArray[np.integer] | None = None,
         CVR: NDArray[np.integer] | None = None,
     ) -> None:
-        if compiler_type != "cobra":
-            raise ValueError(f"Unsupported compiler_type: {compiler_type}.")
+        compiler_type = str(compiler_type).strip().lower()
+        if compiler_type not in {"cobra", "noise"}:
+            raise ValueError(
+                f"Unsupported compiler_type: {compiler_type}. "
+                "Expected 'cobra' or 'noise'."
+            )
         if alpha <= 0.0:
             raise ValueError("alpha must be positive.")
 
         self.verbose = False
+        self.audit_graph = audit_graph
         self.compiler_type = compiler_type
         self.noise_level = float(noise_level)
         self.noise_guess = self.noise_level if noise_guess is None else float(noise_guess)
@@ -107,7 +119,8 @@ class GlobalAuditDriver:
             CVR=CVR,
         )
 
-        self.compilers: list[CobraCompiler] = []
+        self.interpreters: dict[Any, VertexInterpreter] = {}
+        self.compilers: list[CobraCompilerV2Base | CobraCompiler] = []
         self.compiler_info: list[EscapeCompilerInfo] = []
         self.compiler_index_by_escape_id: dict[str, int] = {}
         self._initialize_compilers(
@@ -276,29 +289,161 @@ class GlobalAuditDriver:
             candidate=candidate,
             action=action,
         )
-        compiler = CobraCompiler(
-            vertex,
-            candidate,
-            action,
-            audit_graph=audit_graph,
-            noise_level_guess=self.noise_guess,
-            simultaneous=simultaneous,
-            remember_discrepancies=remember_discrepancies,
-            use_fallback=use_fallback,
-            compiler_label=info.escape_id,
-        )
+        compiler: CobraCompilerV2Base | CobraCompiler
+        if self.compiler_type == "noise":
+            compiler = self._make_noise_filter_compiler(
+                audit_graph=audit_graph,
+                vertex=vertex,
+                candidate=candidate,
+                action=action,
+                simultaneous=simultaneous,
+                label=info.escape_id,
+            )
+        else:
+            compiler = CobraCompiler(
+                vertex,
+                candidate,
+                action,
+                audit_graph=audit_graph,
+                noise_level_guess=self.noise_guess,
+                simultaneous=simultaneous,
+                remember_discrepancies=remember_discrepancies,
+                use_fallback=use_fallback,
+                compiler_label=info.escape_id,
+            )
         self.compilers.append(compiler)
         self.compiler_info.append(info)
         self.compiler_index_by_escape_id[info.escape_id.upper()] = (
             len(self.compilers) - 1
         )
 
+    def _make_noise_filter_compiler(
+        self,
+        audit_graph: Any,
+        vertex: Any,
+        candidate: int,
+        action: EdgeAction,
+        simultaneous: bool,
+        label: str,
+    ) -> CobraCompilerV2Base:
+        interpreter = self._interpreter_for_vertex(audit_graph, vertex)
+        margin = self._noise_filter_margin(vertex, candidate, action, simultaneous)
+        margin_type = CriticalMarginType(margin["type"])
+        escape_margin = float(margin["margin"])
+        noise_budget = (
+            escape_margin / 2.0
+            if margin_type == CriticalMarginType.CANDIDATE_TO_CANDIDATE
+            else escape_margin
+        )
+        common: dict[str, Any] = {
+            "LAM": float(audit_graph.LAM),
+            "critical_margin": noise_budget,
+            "radius": 2.0 * noise_budget,
+            "alpha": self.alpha,
+            "label": label,
+        }
+
+        compiler: CobraCompilerV2Base
+        if margin_type == CriticalMarginType.CANDIDATE_TO_CANDIDATE:
+            compiler = CobraNoiseFilterCompiler(
+                interpreter,
+                int(margin["c"]),
+                int(margin["l"]),
+                **common,
+            )
+        else:
+            compiler = CobraQuotaNoiseFilterCompiler(
+                interpreter,
+                int(margin["candidate"]),
+                margin_type=margin_type,
+                **common,
+            )
+        return compiler
+
+    def _interpreter_for_vertex(
+        self,
+        audit_graph: Any,
+        vertex: Any,
+    ) -> VertexInterpreter:
+        existing = self.interpreters.get(vertex.ref)
+        if existing is not None:
+            return existing
+        interpreter = VertexInterpreter(audit_graph, vertex)
+        self.interpreters[vertex.ref] = interpreter
+        return interpreter
+
+    def _noise_filter_margin(
+        self,
+        vertex: Any,
+        candidate: int,
+        action: EdgeAction,
+        simultaneous: bool,
+    ) -> dict[str, Any]:
+        """Identify the local coordinates whose noise can enable an escape edge."""
+        tallies = np.asarray(vertex.tallies, dtype=np.float64)
+        graph = self.audit_graph
+
+        if action == EdgeAction.ELIMINATE:
+            forced = np.where(tallies >= graph.quota + graph.LAM)[0]
+            if len(forced) > 0:
+                winner = int(forced[np.argmax(tallies[forced])])
+                return {
+                    "type": CriticalMarginType.CANDIDATE_ABOVE_QUOTA,
+                    "candidate": winner,
+                    "margin": float(tallies[winner] - graph.quota),
+                }
+
+            hopefuls = np.asarray(sorted(vertex.key.hopefuls), dtype=int)
+            lowest = int(hopefuls[np.argmin(tallies[hopefuls])])
+            if lowest == candidate:
+                raise ValueError(
+                    "Elimination escape edge is incoherent: candidate is already "
+                    f"the lowest hopeful. candidate={candidate}, tallies={tallies}."
+                )
+            return {
+                "type": CriticalMarginType.CANDIDATE_TO_CANDIDATE,
+                "c": int(candidate),
+                "l": lowest,
+                "margin": float(tallies[candidate] - tallies[lowest]),
+            }
+
+        c_tally = float(tallies[candidate])
+        if not simultaneous:
+            challengers = np.where(tallies > c_tally + graph.LAM)[0]
+            challengers = np.asarray(
+                [idx for idx in challengers if idx != candidate],
+                dtype=int,
+            )
+            if len(challengers) > 0:
+                winner = int(challengers[np.argmax(tallies[challengers])])
+                return {
+                    "type": CriticalMarginType.CANDIDATE_TO_CANDIDATE,
+                    "c": winner,
+                    "l": int(candidate),
+                    "margin": float(tallies[winner] - c_tally),
+                }
+
+        if c_tally + graph.LAM < graph.quota:
+            return {
+                "type": CriticalMarginType.CANDIDATE_BELOW_QUOTA,
+                "candidate": int(candidate),
+                "margin": float(graph.quota - c_tally),
+            }
+
+        raise ValueError(
+            "Could not identify a noise-filter margin for election escape edge: "
+            f"candidate={candidate}, tally={c_tally}, quota={graph.quota}, "
+            f"LAM={graph.LAM}, simultaneous={simultaneous}."
+        )
+
     def add_compiler(
         self,
-        compiler: CobraCompiler,
+        compiler: CobraCompilerV2Base | CobraCompiler,
         info: EscapeCompilerInfo | None = None,
     ) -> None:
         if info is None:
+            if not isinstance(compiler, CobraCompiler):
+                raise ValueError("info is required when adding a noise-filter compiler.")
             label = getattr(compiler, "compiler_label", None)
             if label is None:
                 label = f"MANUAL{len(self.compilers)}"
@@ -333,6 +478,10 @@ class GlobalAuditDriver:
         strong_vertex = self._find_strong_only_seed_vertex(audit_graph)
         self._validate_no_election_edges_from_strong_vertex(audit_graph, strong_vertex)
         self._initialize_seeded_mentions_data(audit_graph)
+        assert self.seed_frozen_mentions is not None
+        assert self.seed_prebatch_strong_tallies is not None
+        frozen_mentions = self.seed_frozen_mentions
+        strong_tallies = self.seed_prebatch_strong_tallies
 
         for candidate in sorted(self.seed_strong_candidates):
             self._add_compiler(
@@ -347,11 +496,9 @@ class GlobalAuditDriver:
 
         lowest_strong_candidate = min(
             self.seed_strong_candidates,
-            key=lambda candidate: self.seed_prebatch_strong_tallies[candidate],
+            key=lambda candidate: strong_tallies[candidate],
         )
-        lowest_strong_tally = float(
-            self.seed_prebatch_strong_tallies[lowest_strong_candidate]
-        )
+        lowest_strong_tally = float(strong_tallies[lowest_strong_candidate])
 
         for weak_candidate in sorted(self.seed_weak_candidates):
             info = self._make_seed_mentions_compiler_info(
@@ -359,23 +506,43 @@ class GlobalAuditDriver:
                 vertex=strong_vertex,
                 candidate=int(weak_candidate),
             )
-            compiler = CobraCompiler(
-                strong_vertex,
-                int(weak_candidate),
-                EdgeAction.ELIMINATE,
-                audit_graph=audit_graph,
-                noise_level_guess=self.noise_guess,
-                simultaneous=simultaneous,
-                remember_discrepancies=remember_discrepancies,
-                use_fallback=use_fallback,
-                compiler_label=info.escape_id,
-                critical_margin_type=CriticalMarginType.CANDIDATE_TO_MENTIONS,
-                strong_candidates=self.seed_strong_candidates,
-                very_strong_candidates=self.seed_very_strong_candidates,
-                frozen_mentions=self.seed_frozen_mentions,
-                lowest_strong_candidate=int(lowest_strong_candidate),
-                lowest_strong_tally=lowest_strong_tally,
-            )
+            compiler: CobraCompilerV2Base | CobraCompiler
+            if self.compiler_type == "noise":
+                interpreter = self._interpreter_for_vertex(audit_graph, strong_vertex)
+                critical_margin = (
+                    lowest_strong_tally - float(frozen_mentions[weak_candidate])
+                )
+                compiler = CobraMentionsNoiseFilterCompiler(
+                    interpreter,
+                    int(weak_candidate),
+                    strong_candidates=self.seed_strong_candidates,
+                    frozen_mentions=frozen_mentions,
+                    lowest_strong_candidate=int(lowest_strong_candidate),
+                    lowest_strong_tally=lowest_strong_tally,
+                    LAM=float(audit_graph.LAM),
+                    critical_margin=critical_margin,
+                    radius=2.0 * critical_margin,
+                    alpha=self.alpha,
+                    label=info.escape_id,
+                )
+            else:
+                compiler = CobraCompiler(
+                    strong_vertex,
+                    int(weak_candidate),
+                    EdgeAction.ELIMINATE,
+                    audit_graph=audit_graph,
+                    noise_level_guess=self.noise_guess,
+                    simultaneous=simultaneous,
+                    remember_discrepancies=remember_discrepancies,
+                    use_fallback=use_fallback,
+                    compiler_label=info.escape_id,
+                    critical_margin_type=CriticalMarginType.CANDIDATE_TO_MENTIONS,
+                    strong_candidates=self.seed_strong_candidates,
+                    very_strong_candidates=self.seed_very_strong_candidates,
+                    frozen_mentions=frozen_mentions,
+                    lowest_strong_candidate=int(lowest_strong_candidate),
+                    lowest_strong_tally=lowest_strong_tally,
+                )
             self.add_compiler(compiler, info)
 
     def _print_seeded_graph_flag(self, audit_graph: Any) -> None:
@@ -511,7 +678,39 @@ class GlobalAuditDriver:
         print(f"Removed {removed} duplicate compilers.")
         return removed
 
-    def _compiler_signature(self, compiler: CobraCompiler) -> tuple[Any, ...]:
+    def _compiler_signature(
+        self,
+        compiler: CobraCompilerV2Base | CobraCompiler,
+    ) -> tuple[Any, ...]:
+        if isinstance(compiler, CobraNoiseFilterCompiler):
+            return (
+                "noise-filter",
+                compiler.base_vertex.ref,
+                compiler.c,
+                compiler.l,
+                round(float(compiler.LAM), 12),
+                round(float(compiler.critical_margin), 12),
+            )
+        if isinstance(compiler, CobraQuotaNoiseFilterCompiler):
+            return (
+                "quota-noise-filter",
+                compiler.base_vertex.ref,
+                compiler.candidate,
+                compiler.margin_type,
+                round(float(compiler.LAM), 12),
+                round(float(compiler.critical_margin), 12),
+            )
+        if isinstance(compiler, CobraMentionsNoiseFilterCompiler):
+            return (
+                "mentions-noise-filter",
+                compiler.base_vertex.ref,
+                compiler.weak_candidate,
+                compiler.strong_candidate,
+                round(float(compiler.LAM), 12),
+                round(float(compiler.critical_margin), 12),
+            )
+        if not isinstance(compiler, CobraCompiler):
+            raise TypeError(f"Unsupported compiler type: {type(compiler).__name__}.")
         return (
             compiler.base_vertex_label,
             compiler.critical_margin_type,
@@ -594,7 +793,7 @@ class GlobalAuditDriver:
         self.certification_order = []
         self.i = 0
 
-    def lookup_compiler(self, escape_id: str) -> CobraCompiler:
+    def lookup_compiler(self, escape_id: str) -> CobraCompilerV2Base | CobraCompiler:
         normalized = escape_id.strip().upper()
         try:
             return self.compilers[self.compiler_index_by_escape_id[normalized]]
@@ -664,7 +863,11 @@ class GlobalAuditDriver:
         remaining = self._remaining_indices()
         for idx in self._lowest_capital_indices(remaining, 3):
             self._print_compiler_brief(idx)
-            self.compilers[idx].print_info()
+            compiler = self.compilers[idx]
+            if isinstance(compiler, CobraCompiler):
+                compiler.print_info()
+            else:
+                print(compiler.get_info())
 
     def _remaining_indices(self) -> list[int]:
         if self.keep_certified_compilers:
@@ -685,6 +888,13 @@ class GlobalAuditDriver:
     def _print_compiler_brief(self, idx: int) -> None:
         compiler = self.compilers[idx]
         info = self.compiler_info[idx]
+        if not isinstance(compiler, CobraCompiler):
+            print(
+                f"  {info.escape_id}: M={compiler.M:.6g}, "
+                f"escape={info.action.name} {info.candidate}:{info.candidate_name}, "
+                f"margin={compiler.critical_margin}, kind={compiler.compiler_kind}"
+            )
+            return
         print(
             f"  {info.escape_id}: M={compiler.M:.6g}, "
             f"escape={info.action.name} {info.candidate}:{info.candidate_name}, "

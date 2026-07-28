@@ -8,6 +8,8 @@ import numpy as np
 from src.test_processes.cobra import (
     CobraMentionsCompilerV2,
     CobraMentionsNoiseFilterCompiler,
+    CobraNoiseFilterCompiler,
+    CobraQuotaNoiseFilterCompiler,
 )
 from src.test_processes.driver import GlobalAuditDriver, GlobalAuditDriverV2
 from src.wigm_graphs.graph_wigm import WIGMGraphConstructor
@@ -81,6 +83,50 @@ def test_driver_initializes_from_seeded_graph_with_very_strong_preseed_path():
         )
 
     assert len(driver.compilers) > 0
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        noise_driver = GlobalAuditDriver(
+            graph,
+            noise_level=0.0,
+            BAL=rows,
+            CVR=rows,
+            compiler_type="noise",
+            print_diagnostics_every=0,
+            simultaneous=True,
+        )
+
+    assert all(
+        isinstance(
+            compiler,
+            (
+                CobraNoiseFilterCompiler,
+                CobraQuotaNoiseFilterCompiler,
+                CobraMentionsNoiseFilterCompiler,
+            ),
+        )
+        for compiler in noise_driver.compilers
+    )
+    assert any(
+        isinstance(compiler, CobraMentionsNoiseFilterCompiler)
+        for compiler in noise_driver.compilers
+    )
+    assert {compiler.LAM for compiler in noise_driver.compilers} == {
+        float(graph.LAM)
+    }
+    assert all(
+        compiler.radius == 2.0 * compiler.critical_margin
+        for compiler in noise_driver.compilers
+    )
+    mentions_compiler = next(
+        compiler
+        for compiler in noise_driver.compilers
+        if isinstance(compiler, CobraMentionsNoiseFilterCompiler)
+    )
+    assert mentions_compiler.critical_margin == (
+        mentions_compiler.lowest_strong_tally
+        - mentions_compiler.frozen_mentions[mentions_compiler.weak_candidate]
+    )
 
 
 def test_v2_driver_initializes_batch_seeded_mentions_compilers():
